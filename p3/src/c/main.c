@@ -1354,7 +1354,7 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
    the machine right now, not of the layout. Needs-you uses the Casio alert red
    on the same LCD field as its neighbours, without a black inversion. */
 static void draw_state_band(GContext *ctx, GRect band, const char *state, const char *label,
-                            int count, int total, int first_count, int second_count,
+                            int count, int first_count, int second_count,
                             const char *second_state) {
   GColor ink = count > 0 ? state_color(state) : lcd_dim();
   GColor unlit = lcd_ghost_tone();
@@ -1370,20 +1370,13 @@ static void draw_state_band(GContext *ctx, GRect band, const char *state, const 
   int text_x = seg_x + block.w + 8;
   int text_w = band.origin.x + band.size.w - pad - text_x;
 
-  /* The count against the machine total, so a band reads without arithmetic. */
-  char share[16];
-  snprintf(share, sizeof(share), "%d/%d", clamp_int(count, 0, 99), clamp_int(total, 0, 999));
-  int share_w = tracked_width(share, font_legend());
   graphics_context_set_text_color(ctx, ink);
-  draw_tracked(ctx, share, font_legend(),
-               GPoint(band.origin.x + band.size.w - pad - share_w, band.origin.y + 7));
-  draw_tracked_max(ctx, label, font_legend(), GPoint(text_x, band.origin.y + 7),
-                   text_w - share_w - 6);
+  draw_tracked_max(ctx, label, font_legend(), GPoint(text_x, band.origin.y + 7), text_w);
 
   /* This is a capped roster, not a percentage bar: one square is one thread
-     through 14, and 14+ fills the strip. The fraction above remains exact.
-     Fixed 5px cells keep these looking like the chunky squares from the
-     original dashboard. The second colour lets running and monitoring coexist. */
+     through 14, and 14+ fills the strip. The large segment readout remains
+     exact. Fixed 5px cells keep these looking like the chunky squares from
+     the original dashboard. The second colour lets running and monitoring coexist. */
   const int slots = 14;
   const int cell = 5;
   const int gap = 2;
@@ -1516,8 +1509,8 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
     int primary_count = i == 1 ? host->run : band_count[i];
     int secondary_count = i == 1 ? host->monitor : 0;
     draw_state_band(ctx, GRect(inner_x, bands_top + i * (band_h + band_gap), inner_w, band_h),
-                    band_state[i], band_label[i], band_count[i], unsettled,
-                    primary_count, secondary_count, "monitor");
+                    band_state[i], band_label[i], band_count[i], primary_count,
+                    secondary_count, "monitor");
   }
 
   /* The indicator row: hairline, meter with its caption, sync age, and the
