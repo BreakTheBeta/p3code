@@ -21,7 +21,7 @@ stock T3's authenticated WebSocket RPCs.
 
 | Host dashboard | Active threads | Thread detail |
 | --- | --- | --- |
-| ![The host dashboard, showing WORKBENCH with needs-you, running, and idle thread bands](docs/screenshots/00-host-dashboard.png) | ![The active thread list, with needs-you, running, idle, and error rows](docs/screenshots/01-active-thread-list.png) | ![A thread detail page showing its status, provider, and latest summary](docs/screenshots/02-thread-detail.png) |
+| ![The host dashboard, showing WORKBENCH with needs-you, running, and idle thread bands](docs/screenshots/00-host-dashboard.png?v=2) | ![The active thread list, with needs-you, running, idle, and error rows](docs/screenshots/01-active-thread-list.png?v=2) | ![A thread detail page showing its status, provider, and latest summary](docs/screenshots/02-thread-detail.png?v=2) |
 
 ## Quick Start
 
@@ -84,7 +84,7 @@ holding up the others.
 | Select | Open that machine's threads |
 | Select (hold) | Diagnostics — the fault log, kept on the watch instead of flashing errors |
 
-![The host dashboard with roster squares and exact thread counts for WORKBENCH](docs/screenshots/00-host-dashboard.png)
+![The host dashboard with roster squares and exact thread counts for WORKBENCH](docs/screenshots/00-host-dashboard.png?v=2)
 
 **Thread list** — active threads first: anything running, waiting or erroring.
 
@@ -99,7 +99,7 @@ holding up the others.
 
 | Active thread list | Thread actions | Settled thread list |
 | --- | --- | --- |
-| ![Active threads grouped above the project section](docs/screenshots/01-active-thread-list.png) | ![The action menu for an active thread, offering Reply, Settle, and Interrupt](docs/screenshots/10-thread-actions.png) | ![Settled threads with a footer for returning to the active scope](docs/screenshots/06-settled-thread-list.png) |
+| ![Active threads grouped above the project section](docs/screenshots/01-active-thread-list.png?v=2) | ![The action menu for an active thread, offering Reply, Settle, and Interrupt](docs/screenshots/10-thread-actions.png?v=2) | ![Settled threads with a footer for returning to the active scope](docs/screenshots/06-settled-thread-list.png?v=2) |
 
 **Thread detail** — title, project path, provider, status and latest summary.
 
@@ -111,7 +111,7 @@ holding up the others.
 
 | Summary | Transcript |
 | --- | --- |
-| ![A thread summary showing its title, status, provider, and latest response](docs/screenshots/02-thread-detail.png) | ![A paged transcript showing user and agent turns](docs/screenshots/03-thread-transcript.png) |
+| ![A thread summary showing its title, status, provider, and latest response](docs/screenshots/02-thread-detail.png?v=2) | ![A paged transcript showing user and agent turns](docs/screenshots/03-thread-transcript.png?v=2) |
 
 Dictating `stop`, `interrupt` or `cancel turn` interrupts a running turn.
 Approval and user-input prompts from T3 Code are answered the same way.
@@ -136,7 +136,7 @@ battery, frame-rate, and message counters.
 
 | Offline host | Diagnostics |
 | --- | --- |
-| ![An offline REMOTE host showing that its T3 access token has expired](docs/screenshots/05-host-offline.png) | ![The diagnostics page with synchronization, battery, frame-rate, message, and fault information](docs/screenshots/04-diagnostics.png) |
+| ![An offline REMOTE host showing that its T3 access token has expired](docs/screenshots/05-host-offline.png?v=2) | ![The diagnostics page with synchronization, battery, frame-rate, message, and fault information](docs/screenshots/04-diagnostics.png?v=2) |
 
 ## Creating A Project From The Watch
 
@@ -165,7 +165,7 @@ the checkout directory from disk.
 
 | Project list | Create confirmation | Delete menu |
 | --- | --- | --- |
-| ![The project section with p3code, watch-lab, and New project rows](docs/screenshots/07-project-list.png) | ![The cancel-first project creation confirmation menu](docs/screenshots/08-project-create-confirmation.png) | ![The cancel-first project deletion menu](docs/screenshots/09-project-delete-menu.png) |
+| ![The project section with p3code, watch-lab, and New project rows](docs/screenshots/07-project-list.png?v=2) | ![The cancel-first project creation confirmation menu](docs/screenshots/08-project-create-confirmation.png?v=2) | ![The cancel-first project deletion menu](docs/screenshots/09-project-delete-menu.png?v=2) |
 
 ## Reference
 
