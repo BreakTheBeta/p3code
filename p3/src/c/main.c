@@ -1443,7 +1443,8 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   HostItem *host = &s_hosts[clamp_int(s_host_cursor, 0, s_host_count - 1)];
   int inner_x = panel.origin.x + 7;
   int inner_w = panel.size.w - 14;
-  int total = host->needs + host->run + host->monitor + host->idle + host->settled;
+  int unsettled = host->needs + host->run + host->monitor + host->idle;
+  int total = unsettled + host->settled;
   int strip_y = panel.origin.y + panel.size.h - 15;
 
   /* A host that did not answer has no counts worth reading: the trio would be
@@ -1491,7 +1492,8 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
                      GRect(inner_x, panel.origin.y + 2, inner_w, 20),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
   char sub[36];
-  snprintf(sub, sizeof(sub), "%d THREAD%s   %d SETTLED", total, total == 1 ? "" : "S",
+  snprintf(sub, sizeof(sub), "%d THREAD%s   %d SETTLED",
+           clamp_int(unsettled, 0, 999), unsettled == 1 ? "" : "S",
            clamp_int(host->settled, 0, 999));
   draw_caption(ctx, sub, GPoint(inner_x, panel.origin.y + 19), lcd_ink());
 
@@ -1514,7 +1516,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
     int primary_count = i == 1 ? host->run : band_count[i];
     int secondary_count = i == 1 ? host->monitor : 0;
     draw_state_band(ctx, GRect(inner_x, bands_top + i * (band_h + band_gap), inner_w, band_h),
-                    band_state[i], band_label[i], band_count[i], total,
+                    band_state[i], band_label[i], band_count[i], unsettled,
                     primary_count, secondary_count, "monitor");
   }
 
@@ -1524,7 +1526,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, GRect(inner_x, strip_y - 5, inner_w, 1), 0, GCornerNone);
 
   draw_caption(ctx, "ACT", GPoint(inner_x, strip_y - 4), lcd_ink());
-  draw_segment_meter(ctx, GPoint(inner_x + 24, strip_y + 2), 7, total - host->settled, total, glass_accent());
+  draw_segment_meter(ctx, GPoint(inner_x + 24, strip_y + 2), 7, unsettled, total, glass_accent());
 
   char age[12];
   sync_age_text(age, sizeof(age));
