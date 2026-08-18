@@ -13,6 +13,7 @@ let dispatches = []
 let shells = {}
 let deadHosts = new Set()
 let webSocketRequests = []
+let vcsStatusByCwd = {}
 
 const HOST_A = "100.64.0.10:3773"
 const HOST_B = "100.64.0.11:3773"
@@ -64,7 +65,7 @@ function shellSnapshot(overrides = {}) {
       {
         id: "proj_1",
         title: "Pebble",
-        workspaceRoot: "/repo/pebblecode",
+        workspaceRoot: "/repo/p3code",
         defaultModelSelection: { instanceId: "codex", model: "gpt-5-codex" },
         createdAt: iso(10 * DAY_MS),
         updatedAt: iso(10 * DAY_MS),
@@ -172,12 +173,22 @@ class FakeXMLHttpRequest {
 class FakeWebSocket {
   constructor(url) {
     this.url = url
-    webSocketRequests.push({ url })
+    webSocketRequests.push({ url, requests: [] })
     setTimeout(() => this.onopen && this.onopen(), 0)
   }
   send(body) {
     const request = JSON.parse(body)
     webSocketRequests[webSocketRequests.length - 1].request = request
+    webSocketRequests[webSocketRequests.length - 1].requests.push(request)
+    const value = request.tag === "vcs.refreshStatus"
+      ? vcsStatusByCwd[request.payload.cwd]
+      : {
+          cwd: "/repo",
+          providers: [{
+            instanceId: "codex", displayName: "Codex", enabled: true, installed: true, status: "ready",
+            models: [{ slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" }],
+          }],
+        }
     setTimeout(() => {
       if (this.onmessage) {
         this.onmessage({ data: JSON.stringify({
@@ -185,12 +196,7 @@ class FakeWebSocket {
           requestId: request.id,
           exit: {
             _tag: "Success",
-            value: {
-              providers: [{
-                instanceId: "codex", displayName: "Codex", enabled: true, installed: true, status: "ready",
-                models: [{ slug: "gpt-5.6-sol", name: "GPT-5.6 Sol" }],
-              }],
-            },
+            value,
           },
         }) })
       }
@@ -209,18 +215,18 @@ const context = {
   WebSocket: FakeWebSocket,
   localStorage: {
     getItem(key) {
-      if (key === "t3pebble_settings") return storedSettings
+      if (key === "p3_settings") return storedSettings
       return storedValues[key] || null
     },
     setItem(key, value) {
-      if (key === "t3pebble_settings") {
+      if (key === "p3_settings") {
         storedSettings = value
         return
       }
       storedValues[key] = value
     },
     removeItem(key) {
-      if (key === "t3pebble_settings") {
+      if (key === "p3_settings") {
         storedSettings = null
         return
       }
@@ -296,16 +302,20 @@ async function main() {
   context.MAX_APP_MESSAGE_FAILURES = realMaxFailures
 
   // ---------------------------------------------------------------- settings
-  assertJsonEqual(context.settings(), { servers: [], nextServerId: 1, autoSettleAfterDays: 3 })
+  assertJsonEqual(context.settings(), {
+    servers: [], nextServerId: 1, autoSettleAfterDays: 3, autoSettleOnMerge: true,
+  })
 
   assert.match(context.configurationHtml(), /Base URL/)
   assert.match(context.configurationHtml(), /Access token/)
   assert.match(context.configurationHtml(), /Label/)
   assert.match(context.configurationHtml(), /Add server/)
   assert.match(context.configurationHtml(), /Settle a quiet thread after/)
+  assert.match(context.configurationHtml(), /Auto-settle merged pull requests/)
 
-  // The auto-settle window is the one classification input T3 keeps to itself,
-  // so it has to survive the round trip and clamp to T3's own 1..90 range.
+  // The auto-settle controls are classification inputs T3 keeps client-local,
+  // so they have to survive the Pebble settings round trip. Clamp the window
+  // to T3's own 1..90 range.
   // Anything unreadable falls back to T3's default rather than to "never" -- a
   // typo must not stop the watch settling anything ever again.
   assert.strictEqual(context.normalizeAutoSettleDays(null), null)
@@ -315,8 +325,11 @@ async function main() {
   assert.strictEqual(context.normalizeAutoSettleDays(500), 90)
   assert.strictEqual(context.normalizeAutoSettleDays("7"), 7)
 
-  storedSettings = JSON.stringify({ baseUrl: "http://old-host:4096", token: "keep-me" })
-  context.localStorage.setItem("t3pebble_build_label", "v0.2.0")
+  context.localStorage.clear()
+  storedValues.t3pebble_settings = JSON.stringify({
+    baseUrl: "http://old-host:4096", token: "keep-me",
+  })
+  storedValues.t3pebble_build_label = "v0.2.0"
   assertJsonEqual(context.settings(), {
     servers: [{
       id: "s1", label: "old-host:4096", baseUrl: "http://old-host:4096", token: "keep-me",
@@ -324,9 +337,11 @@ async function main() {
     }],
     nextServerId: 2,
     autoSettleAfterDays: 3,
+    autoSettleOnMerge: true,
   })
 
-  context.localStorage.setItem("t3pebble_build_label", context.BUILD_LABEL)
+  assert.ok(storedSettings, "the P3 key should receive migrated legacy settings")
+  context.localStorage.setItem("p3_build_label", context.BUILD_LABEL)
   storedSettings = JSON.stringify({
     servers: [
       { label: "beta1", baseUrl: "http://a:3773/", token: "ta" },
@@ -386,12 +401,98 @@ async function main() {
     })
   })
   assert.strictEqual(fetchedConfig.providers[0].models[0].slug, "gpt-5.6-sol")
+  assert.strictEqual(fetchedConfig.cwd, "/repo")
   assert.match(webSocketRequests[0].url, /^ws:\/\/100\.64\.0\.10:3773\/ws\?wsTicket=/)
   assertJsonEqual(webSocketRequests[0].request, {
     _tag: "Request", id: 1, tag: "server.getConfig", payload: {}, headers: [],
   })
+
+  context.cacheShell(
+    { id: "fresh", baseUrl: "http://100.64.0.10:3773", token: "token-a" },
+    { projects: [], threads: [] },
+  )
+  const freshRoot = await new Promise((resolve, reject) => {
+    context.resolveProjectRoot(
+      { id: "fresh", baseUrl: "http://100.64.0.10:3773", token: "token-a" },
+      (error, value) => error ? reject(error) : resolve(value),
+    )
+  })
+  assert.strictEqual(freshRoot, "/repo")
   const ticketRequest = requests.find((request) => request.pathname === "/api/auth/websocket-ticket")
   assert.strictEqual(ticketRequest.headers.authorization, "Bearer token-a")
+
+  vcsStatusByCwd["/repo/feature"] = {
+    refName: "feature/pr-state",
+    pr: { state: "merged" },
+  }
+  const fetchedStatuses = await new Promise((resolve, reject) => {
+    context.fetchVcsStatuses(
+      { id: "s1", baseUrl: "http://100.64.0.10:3773", token: "token-a" },
+      ["/repo/feature"],
+      (error, value) => error ? reject(error) : resolve(value),
+    )
+  })
+  assert.strictEqual(fetchedStatuses["$/repo/feature"].pr.state, "merged")
+  const vcsRequest = webSocketRequests.find((entry) => entry.request.tag === "vcs.refreshStatus")
+  assertJsonEqual(vcsRequest.request, {
+    _tag: "Request", id: 1, tag: "vcs.refreshStatus",
+    payload: { cwd: "/repo/feature" }, headers: [],
+  })
+
+  const prShell = shellSnapshot({
+    threads: [shellThread({ id: "pr-thread", branch: "feature/pr-state" })],
+  })
+  vcsStatusByCwd["/repo/p3code"] = {
+    refName: "feature/pr-state",
+    pr: { state: "merged" },
+  }
+  await new Promise((resolve) => {
+    context.enrichShellChangeRequests(
+      { id: "s1", baseUrl: "http://100.64.0.10:3773", token: "token-a" },
+      prShell,
+      resolve,
+    )
+  })
+  assert.strictEqual(prShell.threads[0].changeRequestState, "merged")
+  assert.strictEqual(context.threadState(prShell.threads[0], NOW), "settled")
+  // Local threads share a checkout. Once T3 has observed a terminal PR, its
+  // sidebar retains that state when the checkout moves back to main.
+  vcsStatusByCwd["/repo/p3code"] = { refName: "main", pr: null }
+  await new Promise((resolve) => {
+    context.enrichShellChangeRequests(
+      { id: "s1", baseUrl: "http://100.64.0.10:3773", token: "token-a" },
+      prShell,
+      resolve,
+    )
+  })
+  assert.strictEqual(prShell.threads[0].changeRequestState, "merged")
+
+  const worktreeShell = shellSnapshot({
+    threads: [shellThread({
+      id: "worktree-pr", branch: "feature/worktree", worktreePath: "/repo/worktree",
+    })],
+  })
+  vcsStatusByCwd["/repo/worktree"] = {
+    refName: "feature/worktree",
+    pr: { state: "open" },
+  }
+  await new Promise((resolve) => {
+    context.enrichShellChangeRequests(
+      { id: "s1", baseUrl: "http://100.64.0.10:3773", token: "token-a" },
+      worktreeShell,
+      resolve,
+    )
+  })
+  assert.strictEqual(worktreeShell.threads[0].changeRequestState, "open")
+  vcsStatusByCwd["/repo/worktree"] = { refName: "feature/worktree", pr: null }
+  await new Promise((resolve) => {
+    context.enrichShellChangeRequests(
+      { id: "s1", baseUrl: "http://100.64.0.10:3773", token: "token-a" },
+      worktreeShell,
+      resolve,
+    )
+  })
+  assert.strictEqual(worktreeShell.threads[0].changeRequestState, undefined)
 
   // ------------------------------------------------ settled classification
   // Mirrors T3 Code's effectiveSettled: activity blockers outrank any override.
@@ -402,11 +503,17 @@ async function main() {
   assert.strictEqual(st({ session: { status: "running", updatedAt: iso(1000) } }), "run")
   assert.strictEqual(st({ session: { status: "starting", updatedAt: iso(1000) } }), "run")
   assert.strictEqual(st({ backgroundLiveness: "working" }), "run")
+  assert.strictEqual(st({ backgroundLiveness: "monitoring" }), "monitor")
+  assert.strictEqual(
+    context.threadDetailLine(shellThread({ backgroundLiveness: "monitoring" }), "monitor", NOW, null),
+    "monitoring",
+  )
 
   // Background liveness is a label in T3, never a settle blocker: a fleet of
   // subagents winding down after the turn does not hold a settled thread in
   // the active list. This is the one that made settled threads read RUNNING.
   assert.strictEqual(st({ settledOverride: "settled", backgroundLiveness: "working" }), "settled")
+  assert.strictEqual(st({ settledOverride: "settled", backgroundLiveness: "monitoring" }), "settled")
   assert.strictEqual(
     st({
       backgroundLiveness: "working",
@@ -440,6 +547,31 @@ async function main() {
   assert.strictEqual(st({ settledOverride: "settled" }), "settled")
   assert.strictEqual(st({ settledOverride: "active" }), "idle")
 
+  // T3 folds the current branch's PR state into the same partition. Terminal
+  // PRs settle immediately, while an open PR blocks inactivity auto-settle.
+  assert.strictEqual(st({ changeRequestState: "merged" }), "settled")
+  assert.strictEqual(st({ changeRequestState: "closed" }), "settled")
+  assert.strictEqual(st({
+    changeRequestState: "open",
+    latestUserMessageAt: iso(5 * DAY_MS),
+    latestTurn: {
+      state: "completed", requestedAt: iso(5 * DAY_MS),
+      startedAt: iso(5 * DAY_MS), completedAt: iso(5 * DAY_MS),
+    },
+  }), "idle")
+  assert.strictEqual(
+    st({ changeRequestState: "merged", hasPendingApprovals: true }),
+    "needs",
+  )
+  assert.strictEqual(
+    st({ changeRequestState: "merged", settledOverride: "active" }),
+    "idle",
+  )
+  context.autoSettleOnMerge = false
+  assert.strictEqual(st({ changeRequestState: "merged" }), "idle")
+  assert.strictEqual(st({ changeRequestState: "closed" }), "settled")
+  context.autoSettleOnMerge = true
+
   // Auto-settle after T3's 3-day default; a 2-day-old thread stays idle.
   assert.strictEqual(
     st({
@@ -469,6 +601,10 @@ async function main() {
     st({ pinnedAt: iso(6 * DAY_MS), snoozedUntil: new Date(NOW + 3600000).toISOString(), snoozedAt: iso(1000) }),
     "snooze",
   )
+  assert.strictEqual(
+    st({ backgroundLiveness: "monitoring", snoozedUntil: new Date(NOW + 3600000).toISOString(), snoozedAt: iso(1000) }),
+    "snooze",
+  )
 
   // A finished plan-mode turn with a plan to accept is blocked on the user.
   const planReady = { interactionMode: "plan", hasActionableProposedPlan: true }
@@ -478,6 +614,7 @@ async function main() {
   assert.strictEqual(st({ ...planReady, interactionMode: "default" }), "idle")
   assert.strictEqual(st({ ...planReady, latestTurn: { state: "running", requestedAt: iso(60000), startedAt: iso(59000), completedAt: null } }), "idle")
   assert.strictEqual(st({ ...planReady, hasPendingUserInput: true }), "needs")
+  assert.strictEqual(st({ ...planReady, backgroundLiveness: "monitoring" }), "needs")
   // It is a status, not a settle blocker: T3 ages a stale plan out the same way.
   assert.strictEqual(st({ ...planReady, ...stale }), "settled")
   // The plan row carries T3's own words rather than an empty wait.
@@ -487,6 +624,10 @@ async function main() {
   )
 
   assert.strictEqual(st({ session: { status: "error", updatedAt: iso(1000) } }), "err")
+  assert.strictEqual(
+    st({ session: { status: "error", updatedAt: iso(1000) }, backgroundLiveness: "monitoring" }),
+    "err",
+  )
   assert.strictEqual(st({ snoozedUntil: new Date(NOW + 3600000).toISOString(), snoozedAt: iso(1000) }), "snooze")
   // A snoozed thread that raises its hand is not hidden.
   assert.strictEqual(
@@ -503,6 +644,9 @@ async function main() {
   // place while its turns land instead of jumping to the top on every reply.
   const ordering = {
     threads: [
+      shellThread({ id: "pinned-z", createdAt: iso(40 * DAY_MS), pinnedAt: iso(1000), pinOrderKey: "z" }),
+      shellThread({ id: "pinned-b", createdAt: iso(50 * DAY_MS), pinnedAt: iso(1000), pinOrderKey: "b" }),
+      shellThread({ id: "pinned-keyless", createdAt: iso(2 * DAY_MS), pinnedAt: iso(1000), pinOrderKey: null }),
       shellThread({ id: "old-busy", createdAt: iso(9 * DAY_MS), updatedAt: iso(1000), latestUserMessageAt: iso(1000), latestTurn: { state: "completed", requestedAt: iso(1000), startedAt: iso(1000), completedAt: iso(1000) } }),
       shellThread({ id: "new-quiet", createdAt: iso(60000), updatedAt: iso(60000), latestUserMessageAt: iso(60000), latestTurn: { state: "completed", requestedAt: iso(60000), startedAt: iso(60000), completedAt: iso(60000) } }),
       // Settled long ago, but the projection touched it a minute back: T3
@@ -513,7 +657,7 @@ async function main() {
   }
   assertJsonEqual(
     context.threadsForScope(ordering, 0, NOW).map((t) => t.id),
-    ["new-quiet", "old-busy"],
+    ["pinned-b", "pinned-z", "pinned-keyless", "new-quiet", "old-busy"],
   )
   // Settled rows are history: settledAt first, then when the work ended.
   assertJsonEqual(
@@ -535,16 +679,22 @@ async function main() {
   }
   assert.strictEqual(context.liveThreads(crowd).length, context.MAX_SESSIONS + 5)
   assert.strictEqual(context.rollupForThreads(context.liveThreads(crowd), NOW).needs, 1)
+  assert.strictEqual(
+    context.rollupForThreads([shellThread({ backgroundLiveness: "monitoring" })], NOW).monitor,
+    1,
+  )
 
-  assert.strictEqual(context.hostStateFromCounts({ needs: 1, run: 2, err: 0, idle: 3, settled: 4, total: 10 }), "needs")
-  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 2, err: 1, idle: 3, settled: 4, total: 10 }), "run")
-  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 1, idle: 3, settled: 4, total: 8 }), "err")
-  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 0, idle: 3, settled: 4, total: 7 }), "idle")
-  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 0, idle: 0, settled: 4, total: 4 }), "settled")
-  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 0, idle: 0, settled: 0, total: 0 }), "empty")
+  assert.strictEqual(context.hostStateFromCounts({ needs: 1, run: 2, err: 0, monitor: 1, idle: 3, settled: 4, total: 11 }), "needs")
+  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 2, err: 1, monitor: 1, idle: 3, settled: 4, total: 11 }), "run")
+  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 1, monitor: 1, idle: 3, settled: 4, total: 9 }), "err")
+  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 0, monitor: 1, idle: 3, settled: 4, total: 8 }), "monitor")
+  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 0, monitor: 0, idle: 3, settled: 4, total: 7 }), "idle")
+  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 0, monitor: 0, idle: 0, settled: 4, total: 4 }), "settled")
+  assert.strictEqual(context.hostStateFromCounts({ needs: 0, run: 0, err: 0, monitor: 0, idle: 0, settled: 0, total: 0 }), "empty")
 
   assert.strictEqual(context.hostDetailLine("settled", { settled: 4, total: 4 }), "all settled")
   assert.strictEqual(context.hostDetailLine("needs", { needs: 2 }), "2 need you")
+  assert.strictEqual(context.hostDetailLine("monitor", { monitor: 2 }), "2 monitoring")
   assert.strictEqual(context.hostDetailLine("idle", { idle: 3 }), "3 idle")
   assert.strictEqual(context.hostDetailLine("empty", { total: 0 }), "no threads")
 
@@ -608,7 +758,12 @@ async function main() {
     { id: "s2", label: "mini", baseUrl: "http://" + HOST_B, token: "token-b" },
   ])
   shells = {
-    [HOST_A]: shellSnapshot({ threads: [shellThread({ id: "t_needs", hasPendingApprovals: true })] }),
+    [HOST_A]: shellSnapshot({
+      threads: [
+        shellThread({ id: "t_needs", hasPendingApprovals: true }),
+        shellThread({ id: "t_monitor", backgroundLiveness: "monitoring" }),
+      ],
+    }),
     [HOST_B]: shellSnapshot({
       threads: [
         shellThread({ id: "t_settled", settledOverride: "settled" }),
@@ -632,6 +787,7 @@ async function main() {
   assertJsonEqual(hostRows.map((m) => m.title), ["beta1", "mini"])
   assertJsonEqual(hostRows.map((m) => m.state), ["needs", "settled"])
   assertJsonEqual(hostRows.map((m) => m.detail), ["1 need you", "all settled"])
+  assert.strictEqual(hostRows[0].c_monitor, 1)
 
   // One shell request per host and nothing more: no per-thread hydration.
   assert.strictEqual(requests.filter((r) => r.pathname === "/api/orchestration/shell").length, 2)
@@ -860,11 +1016,11 @@ async function main() {
 
   const bundle = context.parseServerBundle(
     [
-      "T3 Pebble server",
-      "t3pebble1|beta1|https://beta1.tail253492.ts.net|tok_one",
+      "P3 server",
+      "p3code1|beta1|https://beta1.tail253492.ts.net|tok_one",
       "  t3pebble1|mini|https://mini.tail253492.ts.net/|tok_two  ",
-      "t3pebble1|broken|https://nope.ts.net",
-      "t3pebble1||https://unlabelled.ts.net|tok_three",
+      "p3code1|broken|https://nope.ts.net",
+      "p3code1||https://unlabelled.ts.net|tok_three",
       "not a bundle line",
     ].join("\n")
   )
@@ -879,7 +1035,7 @@ async function main() {
   // Field four is optional, so it can carry the project root without breaking
   // lines written before it existed.
   const withRoot = context.parseServerBundle(
-    "t3pebble1|beta1|https://beta1.ts.net|tok|/home/will/Projects/"
+    "p3code1|beta1|https://beta1.ts.net|tok|/home/will/Projects/"
   )
   assert.strictEqual(withRoot[0].projectRoot, "/home/will/Projects")
   // A trailing slash would otherwise produce a double slash in every path.
@@ -929,6 +1085,7 @@ async function main() {
     pasteMsg: { textContent: "" },
     servers: { innerHTML: "" },
     autoSettle: { value: "3" },
+    autoSettleMerge: { checked: true },
   }
   const page = {
     console,
@@ -939,8 +1096,8 @@ async function main() {
   vm.runInContext(pageScript, page)
 
   els.bundle.value = [
-    "t3pebble1|beta1|https://beta1.tail253492.ts.net|tok_beta",
-    "t3pebble1|mini|https://mini.tail253492.ts.net|tok_mini",
+    "p3code1|beta1|https://beta1.tail253492.ts.net|tok_beta",
+    "p3code1|mini|https://mini.tail253492.ts.net|tok_mini",
   ].join("\n")
   page.addFromPaste()
   // The blank seed row is consumed rather than left behind as an empty entry.
@@ -948,7 +1105,7 @@ async function main() {
   assert.strictEqual(els.bundle.value, "")
 
   // Re-running the command on a host rotates its token in place.
-  els.bundle.value = "t3pebble1|mini|https://mini.tail253492.ts.net|tok_rotated"
+  els.bundle.value = "p3code1|mini|https://mini.tail253492.ts.net|tok_rotated"
   page.addFromPaste()
   assert.strictEqual(page.servers.length, 2)
   assert.strictEqual(page.servers[1].token, "tok_rotated")
@@ -968,6 +1125,14 @@ async function main() {
   assert.strictEqual(round.servers[0].label, "beta1")
   assert.strictEqual(round.servers[1].token, "tok_rotated")
   assert.strictEqual(round.autoSettleAfterDays, 7)
+  assert.strictEqual(round.autoSettleOnMerge, true)
+  els.autoSettleMerge.checked = false
+  page.save()
+  assert.strictEqual(
+    context.normalizeSettings(JSON.parse(decodeURIComponent(page.location.href.split("#")[1])))
+      .autoSettleOnMerge,
+    false,
+  )
   // Blank is "never", which is a real T3 setting and not a missing value.
   els.autoSettle.value = ""
   page.save()
@@ -1022,6 +1187,25 @@ async function main() {
   // No root configured means the flow is off, not that it guesses a location.
   assert.strictEqual(context.projectPathFor({ projectRoot: "" }, "anything"), "")
   assert.strictEqual(context.projectPathFor({ projectRoot: "/tmp" }, "!!!"), "")
+  assert.strictEqual(
+    context.inferredProjectRoot({ projects: [
+      { workspaceRoot: "/home/will/Projects/p3code" },
+      { workspaceRoot: "/home/will/Projects/muster" },
+    ] }),
+    "/home/will/Projects",
+  )
+  assert.strictEqual(
+    context.inferredProjectRoot({ projects: [{ workspaceRoot: "/repo/p3code" }] }),
+    "/repo",
+  )
+  assert.strictEqual(
+    context.inferredProjectRoot({ projects: [
+      { workspaceRoot: "/home/will/project" },
+      { workspaceRoot: "/tmp/project" },
+    ] }),
+    "",
+    "must not infer the filesystem root",
+  )
 
   console.log("phone bridge tests passed")
 }

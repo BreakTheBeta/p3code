@@ -15,7 +15,7 @@ const CMD = {
   context: 7, status: 8, projectItem: 9, projectEnd: 10, newThread: 11,
   hostItem: 12, hostEnd: 13, selectHost: 14, threadAction: 15,
   projectName: 16, projectPreview: 17, projectCreate: 18, concierge: 19,
-  modelRequest: 20, modelItem: 21, modelEnd: 22,
+  modelRequest: 20, modelItem: 21, modelEnd: 22, projectDelete: 23,
 }
 
 const KEY = {
@@ -62,7 +62,7 @@ function createShell() {
       {
         id: "proj_pebble",
         title: "Pebble",
-        workspaceRoot: "/repo/pebblecode",
+        workspaceRoot: "/repo/p3code",
         defaultModelSelection: { instanceId: "codex", model: "gpt-5-codex" },
         createdAt: iso(10 * DAY_MS),
         updatedAt: iso(10 * DAY_MS),
@@ -95,6 +95,11 @@ function createShell() {
         ],
       }),
       baseThread({
+        id: "ses_monitoring",
+        title: "Release Monitor",
+        backgroundLiveness: "monitoring",
+      }),
+      baseThread({
         id: "ses_settled",
         title: "Docs",
         settledOverride: "settled",
@@ -113,7 +118,7 @@ function createBridge(baseUrl, state, buildLabel) {
     servers: [{ id: "s1", label: "beta1", baseUrl, token: "t3-access-token" }],
     nextServerId: 2,
   })
-  const storedValues = { t3pebble_build_label: buildLabel }
+  const storedValues = { p3_build_label: buildLabel }
   const listeners = {}
   const sentMessages = []
 
@@ -122,7 +127,21 @@ function createBridge(baseUrl, state, buildLabel) {
     state.requests.push({ method, url, pathname, query, headers })
 
     if (method === "POST" && pathname === "/api/orchestration/dispatch") {
-      state.dispatches.push(JSON.parse(body))
+      const command = JSON.parse(body)
+      state.dispatches.push(command)
+      if (command.type === "project.create") {
+        state.shell.projects.push({
+          id: command.projectId,
+          title: command.title,
+          workspaceRoot: command.workspaceRoot,
+          defaultModelSelection: null,
+          createdAt: command.createdAt,
+          updatedAt: command.createdAt,
+        })
+      } else if (command.type === "project.delete") {
+        const project = state.shell.projects.find((item) => item.id === command.projectId)
+        if (project) project.deletedAt = new Date().toISOString()
+      }
       return { status: 200, body: JSON.stringify({ sequence: 1 }) }
     }
 
@@ -196,11 +215,11 @@ function createBridge(baseUrl, state, buildLabel) {
     XMLHttpRequest: FakeXMLHttpRequest,
     localStorage: {
       getItem(key) {
-        if (key === "t3pebble_settings") return storedSettings
+        if (key === "p3_settings") return storedSettings
         return storedValues[key] || null
       },
       setItem(key, value) {
-        if (key === "t3pebble_settings") {
+        if (key === "p3_settings") {
           storedSettings = value
           return
         }
@@ -261,6 +280,7 @@ async function main() {
   // A pending approval outranks everything else on the machine.
   assert.strictEqual(host.state, "needs")
   assert.strictEqual(host.detail, "1 need you")
+  assert.strictEqual(host.c_monitor, 1)
 
   // The host screen costs exactly one request and hydrates nothing.
   assert.strictEqual(state.requests.length, 1)
@@ -274,16 +294,18 @@ async function main() {
     rows[message.session_id] = message
   }
   // Active scope is the default and leaves settled work out of the way.
-  assert.strictEqual(Object.keys(rows).length, 2)
+  assert.strictEqual(Object.keys(rows).length, 3)
   assert.strictEqual(rows["s1::ses_running"].state, "run")
   assert.strictEqual(rows["s1::ses_running"].detail, "running")
   assert.strictEqual(rows["s1::ses_blocked"].state, "needs")
   assert.strictEqual(rows["s1::ses_blocked"].detail, "needs approval")
+  assert.strictEqual(rows["s1::ses_monitoring"].state, "monitor")
+  assert.strictEqual(rows["s1::ses_monitoring"].detail, "monitoring")
   assert.strictEqual(rows["s1::ses_settled"], undefined)
   // The end message carries the other scope's count for the footer row.
   const activeEnd = bridge.sentMessages.filter((m) => m.cmd === CMD.sessionEnd).pop()
   assert.strictEqual(activeEnd.scope, 0)
-  assert.strictEqual(activeEnd.matched, 2)
+  assert.strictEqual(activeEnd.matched, 3)
   assert.strictEqual(activeEnd.other, 1)
 
   // --- settled scope holds the finished work ----------------------------
@@ -298,7 +320,7 @@ async function main() {
   assert.strictEqual(settledRows[0].settled, 1)
   const settledEnd = bridge.sentMessages.filter((m) => m.cmd === CMD.sessionEnd).pop()
   assert.strictEqual(settledEnd.scope, 1)
-  assert.strictEqual(settledEnd.other, 2)
+  assert.strictEqual(settledEnd.other, 3)
 
   // --- settling and unsettling ------------------------------------------
   bridge.listeners.appmessage({
@@ -411,7 +433,7 @@ async function main() {
   await waitFor(() => state.dispatches.length === 2, "turn dispatch")
   assert.strictEqual(state.dispatches[1].type, "thread.turn.start")
   assert.strictEqual(state.dispatches[1].threadId, "ses_settled")
-  assert.match(state.dispatches[1].message.text, /sent from the user's Pebble watch through t3pebble/)
+  assert.match(state.dispatches[1].message.text, /sent from the user's Pebble watch through P3/)
   // The watch never imposes a model on an existing thread.
   assert.strictEqual(state.dispatches[1].modelSelection, undefined)
 
@@ -449,18 +471,21 @@ async function main() {
 
   // --- creating a project from the watch --------------------------------
 
-  // With no project root configured the flow refuses rather than guessing.
+  // Older setup bundles have no project root. Infer the parent of this host's
+  // existing projects so project creation remains available without a settings
+  // migration.
   bridge.sentMessages.length = 0
   bridge.listeners.appmessage({
     payload: { [KEY.cmd]: CMD.projectName, [KEY.hostId]: "s1", [KEY.name]: "sparkle renderer" },
   })
-  await waitFor(() => bridge.sentMessages.find((m) => m.cmd === CMD.error), "no-root error")
-  assert.match(bridge.sentMessages.find((m) => m.cmd === CMD.error).error, /project root/i)
+  const inferredPreview = await waitFor(
+    () => bridge.sentMessages.find((m) => m.cmd === CMD.projectPreview), "inferred project preview")
+  assert.strictEqual(inferredPreview.path, "/repo/sparkle-renderer")
 
   // Give the host a project root, leaving the rest of its settings alone.
-  const stored = JSON.parse(bridge.context.localStorage.getItem("t3pebble_settings"))
+  const stored = JSON.parse(bridge.context.localStorage.getItem("p3_settings"))
   stored.servers[0].projectRoot = "/home/will/Projects"
-  bridge.context.localStorage.setItem("t3pebble_settings", JSON.stringify(stored))
+  bridge.context.localStorage.setItem("p3_settings", JSON.stringify(stored))
 
   bridge.sentMessages.length = 0
   bridge.listeners.appmessage({
@@ -483,6 +508,38 @@ async function main() {
   assert.strictEqual(created.workspaceRoot, "/home/will/Projects/sparkle-renderer")
   assert.strictEqual(created.title, "Sparkle Renderer")
   assert.strictEqual(created.createWorkspaceRootIfMissing, true)
+  const createdRow = await waitFor(
+    () => bridge.sentMessages.find((m) => m.cmd === CMD.projectItem && m.title === "Sparkle Renderer"),
+    "created project row",
+  )
+  assert.strictEqual(createdRow.directory, "/home/will/Projects/sparkle-renderer")
+  assert.ok(bridge.sentMessages.some((m) => m.cmd === CMD.status && m.status === "Project created"))
+  assert.strictEqual(
+    bridge.sentMessages.filter((m) => m.cmd === CMD.prompt).length,
+    0,
+    "project creation must not masquerade as a sent thread prompt",
+  )
+
+  // --- deleting a project from the watch --------------------------------
+
+  bridge.sentMessages.length = 0
+  bridge.listeners.appmessage({
+    payload: { [KEY.cmd]: CMD.projectDelete, [KEY.projectId]: `s1::${created.projectId}` },
+  })
+  const deleted = await waitFor(
+    () => state.dispatches.find((d) => d.type === "project.delete"), "project delete")
+  assert.strictEqual(deleted.projectId, created.projectId)
+  assert.strictEqual(deleted.force, true, "deleting a project must also remove its threads")
+  await waitFor(
+    () => bridge.sentMessages.some((m) => m.cmd === CMD.status && m.status === "Project deleted"),
+    "project deleted status",
+  )
+  await waitFor(() => bridge.sentMessages.some((m) => m.cmd === CMD.projectEnd), "deleted project refresh")
+  assert.strictEqual(
+    bridge.sentMessages.some((m) => m.cmd === CMD.projectItem && m.project_id === `s1::${created.projectId}`),
+    false,
+    "the refreshed list must omit the deleted project",
+  )
 
   assert.deepStrictEqual(
     bridge.sentMessages.filter((m) => m.cmd === CMD.error).map((m) => m.error),

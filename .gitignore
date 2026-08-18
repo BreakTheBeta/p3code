@@ -2,11 +2,11 @@
 dist/
 t3code/
 
-pebblecode/build/
-pebblecode/.lock-waf_*
+p3/build/
+p3/.lock-waf_*
 
 *.log
 *.tmp
 
-# Stray capture artifact from a Docker emulator run; the rig writes to dist/.
-pebblecode/shot.png
+# Stray capture artifact from an old emulator run.
+p3/shot.png

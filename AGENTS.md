@@ -2,7 +2,7 @@
 
 ## Build and Test
 
-Run Pebble bridge checks and build from `pebblecode/`:
+Run Pebble bridge checks and build from `p3/`:
 
 ```sh
 node --check src/pkjs/index.js
@@ -15,28 +15,54 @@ pebble build
 Copy the installable bundle from the repo root:
 
 ```sh
-cp pebblecode/build/pebblecode.pbw dist/t3pebble.pbw
+cp p3/build/p3.pbw dist/p3.pbw
 ```
 
 ## T3 Code
 
 The app runs against stock T3 Code (the published `t3` CLI). Do not patch T3 Code, and do not reintroduce `--auth-token` or `orchestration.getSnapshot`; both were fork-only. The bridge authenticates with a bearer token from `t3 auth session issue` and uses the REST routes documented in `docs/t3code-compatibility.md`.
 
-`./verify-t3pebble.sh` runs the bridge tests, builds the PBW, and smoke-tests against a real `t3 serve` on a throwaway data directory.
+`./verify-p3.sh` runs the bridge tests, builds the PBW, and smoke-tests against a real `t3 serve` on a throwaway data directory.
 
 Thread lists are scoped: `SCOPE_ACTIVE` (0) or `SCOPE_SETTLED` (1), carried on `CMD_SELECT_HOST` with an offset. `CMD_SESSION_END` reports `scope`, `offset`, `matched` (the scope's total) and `other` (the opposite scope's total), which is everything the watch needs to label its footer rows without a second request. Footer rows are derived in `rebuild_footers()`, never sent.
+
+T3's `backgroundLiveness: "monitoring"` is its own watch state, `monitor`, not
+idle and not actively running. It follows the sidebar's priority after error
+and Plan Ready but before idle. Monitoring uses Casio green without a pulse or
+animation timer. `c_monitor` carries its host aggregate; the home screen folds
+monitoring into the running band while retaining green monitoring squares.
+
+The small meters in those three home-screen bands are capped rosters, not
+percentage bars: one fixed-size square represents one thread through 14, and a
+count of 14 or more fills the strip. The exact count remains in the fraction at
+the right. The running band draws active-running squares in blue followed by
+monitoring squares in green, and leaves the rest ghosted. On emery, fourteen
+5x5 cells with 2px gaps occupy 96px and are centred in the 104px field beside
+the 56px `SegMid` readout; keep that geometry inside each 41px band.
+The needs-you band uses alert red for its lit digits, text, and squares on the
+normal LCD field; it does not invert to a black background.
+
+Settlement mirrors T3's sidebar partition, including live PR state. After the
+shell REST read, the bridge batches one `vcs.refreshStatus` request per distinct
+checkout over a single ticketed WebSocket for that host. A closed PR settles, a
+merged PR follows `autoSettleOnMerge`, and an open PR blocks inactivity
+auto-settle. VCS failure is optional metadata: retain prior snapshots and never
+mark a host offline for it. Local threads retain an observed terminal PR after
+the shared checkout moves away; worktree snapshots stay branch-matched. Pinned
+threads lead `SCOPE_ACTIVE` in `pinOrderKey` order, with keyless pins newest
+first, before ordinary active threads.
 
 `XMLHttpRequest` reports every pre-HTTP failure as status 0 with nothing else, so a sleeping laptop, a wrong port, a stopped server and an unresolvable name all used to arrive as `T3 unreachable`. `transportFailure()` reconstructs the diagnosis from the two things the phone does know — the address it dialled and how long the attempt took: silence to the full timeout is a machine that never answered, a fast failure is something answering "no". Errors it raises are tagged `transport`, which is what lets `refreshHosts()` say "all N hosts unreachable" — an HTTP reply, 502 included, is the server talking and must never be escalated into a claim about the link. None of these sentences may carry measured milliseconds: an offline row that differs byte-for-byte each poll defeats the row suppression below and spends Bluetooth every cycle, which `bridge.test.js` asserts against directly.
 
 Host failures are per-host, never global: `refreshHosts()` turns a failed probe into an `offline` row carrying the reason and keeps going, and it logs one fault per down machine rather than one joined line, so two dead hosts cost two of the six fault-log slots instead of sharing a truncated one. The watch gives an offline host the whole panel for that sentence — the counts trio and the 64pt headline are dropped, since they would only read zero — and SELECT on an offline row retries the probe instead of opening a thread list that would sit out the full request timeout. Keep `HOST_FAILURE_LIMIT` (bridge), `HostItem.detail` and `ERROR_TEXT_MAX` (watch) in step; the smallest of them is what actually reaches the glass.
 
-`pebblecode/protocol.json` is the single source of truth for the wire protocol and the build label. Add a key there, run `node tools/gen-protocol.js`, and it writes the generated blocks in `appinfo.json` `appKeys`, `main.c` and `src/pkjs/index.js` — the JS side uses string keys and the C side numeric ones, and both are emitted from the same table. Never hand-edit inside a `@generated protocol:begin/end` block. `node test/protocol.test.js` fails if any copy has drifted, and it also checks that the bridge's truncation limits fit inside the watch's fields (`HOST_FAILURE_LIMIT`/`HostItem.detail`, `SUMMARY_LIMIT`/`SessionItem.summary`, `sendError`/`ERROR_TEXT_MAX`).
+`p3/protocol.json` is the single source of truth for the wire protocol and the build label. Add a key there, run `node tools/gen-protocol.js`, and it writes the generated blocks in `appinfo.json` `appKeys`, `main.c` and `src/pkjs/index.js` — the JS side uses string keys and the C side numeric ones, and both are emitted from the same table. Never hand-edit inside a `@generated protocol:begin/end` block. `node test/protocol.test.js` fails if any copy has drifted, and it also checks that the bridge's truncation limits fit inside the watch's fields (`HOST_FAILURE_LIMIT`/`HostItem.detail`, `SUMMARY_LIMIT`/`SessionItem.summary`, `sendError`/`ERROR_TEXT_MAX`).
 
 `versionLabel` in `appinfo.json` is `buildLabel` with the leading `v` stripped, so keep `buildLabel` to `vMajor.Minor` — the SDK rejects a three-component version.
 
 **The home screen animates nothing at rest, and that is a requirement, not an accident.** It is the screen that gets left open for hours, so with no request in flight `animation_active()` returns false there and no timer is registered at all. A machine working somewhere else is a fact, not an event: `draw_state_mark()` takes an `animated` flag which is false on the home screen, where colour and the filled shape already carry "running". Do not reintroduce a pulse, a blink, a live seconds counter or a marquee on this screen — anything that has to move needs a timer, and a timer here runs forever. The thread list is a surface you actively browse rather than park on, so it still passes `animated = true`.
 
-The animation timer therefore runs only while something is in flight, at `BUSY_TICK_MS` (110 ms), plus the thread list's `IDLE_TICK_MS` (440 ms) when a row on it is running. `s_stream_phase` advances by `IDLE_TICK_STEP` on a slow tick so every consumer's existing divisor lands on the same on-glass rate; do not "fix" a divisor to compensate. The progress sweep lives on `s_host_rail_layer`, a 200x6 strip from `host_rail_box()` shown exactly while `busy_any()`, so a refresh against a sleeping laptop costs 72 repaints of a six-pixel band rather than of the whole panel. `draw_self_test()`'s walking digit is gated on `busy_any()` for the same reason — without a timer behind it, it would freeze wherever the last tick left it.
+The animation timer therefore runs only while something is in flight, at `BUSY_TICK_MS` (110 ms), plus the thread list's `IDLE_TICK_MS` (440 ms) when a row on it is running. `s_stream_phase` advances by `IDLE_TICK_STEP` on a slow tick so every consumer's existing divisor lands on the same on-glass rate; do not "fix" a divisor to compensate. The progress sweep lives on `s_host_rail_layer`, a 200x6 strip from `host_rail_box()` shown exactly while `busy_any()`, so a refresh against a sleeping laptop costs 72 repaints of a six-pixel band rather than of the whole panel. The initial CONNECTING screen shows a stationary two-digit elapsed-seconds counter (`00`–`99`); it rides that same fast timer, but `stream_timer_callback()` dirties the full host layer only when the displayed second changes.
 
 `sync_age_text()` reports minute granularity ("now", then "3m") because nothing redraws it faster than that: `minute_tick` rides the `MINUTE_UNIT` tick the system already runs for the clock, costs no wakeup of its own, and repaints only if the host or diagnostics window is actually on top. A live seconds counter would mean a timer purely to animate a caption.
 
@@ -50,9 +76,9 @@ That suppression is what pays for `REFRESH_INTERVAL_MS` being 60 s rather than t
 
 `ActionMenuDidCloseCb`'s second parameter is the performed `ActionMenuItem`, not the root level, despite the SDK's doc comment. Pass the level through `ActionMenuConfig.context` so `action_menu_hierarchy_destroy` has something to free.
 
-Multi-host setup goes through one pasteable line per machine, `t3pebble1|<label>|<base URL>|<token>`, printed by the launch script and parsed by `parseServerBundle()` in the bridge. The settings page embeds that function's own source via `String(parseServerBundle)` rather than reimplementing it, so the two cannot drift — keep it free of helper calls. Pasting a line for an already-configured base URL updates that entry's token instead of appending.
+Multi-host setup goes through one pasteable line per machine, `p3code1|<label>|<base URL>|<token>`, printed by the launch script and parsed by `parseServerBundle()` in the bridge. The settings page embeds that function's own source via `String(parseServerBundle)` rather than reimplementing it, so the two cannot drift — keep it free of helper calls. Pasting a line for an already-configured base URL updates that entry's token instead of appending.
 
-`run-t3code-tailscale.sh` defaults to binding the Tailscale IP over plain HTTP. `T3PEBBLE_TAILSCALE_SERVE=1` opts into publishing loopback over tailnet HTTPS via `tailscale serve --bg` instead, which is what reaches a T3 Code desktop app that only listens on `127.0.0.1`. Keep the default path unchanged; the flag is additive. Auth is the same bearer token in both modes — do not add a pairing exchange to the bridge.
+`run-p3-tailscale.sh` defaults to binding the Tailscale IP over plain HTTP. `P3_TAILSCALE_SERVE=1` opts into publishing loopback over tailnet HTTPS via `tailscale serve --bg` instead, which is what reaches a T3 Code desktop app that only listens on `127.0.0.1`. Keep the default path unchanged; the flag is additive. Auth is the same bearer token in both modes — do not add a pairing exchange to the bridge.
 
 ## Watch Install
 
@@ -65,7 +91,7 @@ The linker's "LOAD segment with RWX permissions" warning is inherent to the Pebb
 Normal install path:
 
 ```sh
-pebble install --phone <phone-ip> dist/t3pebble.pbw
+pebble install --phone <phone-ip> dist/p3.pbw
 ```
 
 If `pebble install --phone ...` or `pebble ping --phone ...` times out fetching watch info, but the Core Devices/Pebble app dev server is open on port `9000`, bypass the old Pebble SDK handshake and install directly through the Core Devices WebSocket protocol.
@@ -76,7 +102,7 @@ Direct Core Devices install:
 node - <<'NODE'
 const fs = require("fs");
 const phone = process.env.PEBBLE_PHONE || "100.76.64.6";
-const pbwPath = process.env.PBW_PATH || "dist/t3pebble.pbw";
+const pbwPath = process.env.PBW_PATH || "dist/p3.pbw";
 const pbw = fs.readFileSync(pbwPath);
 const payload = Buffer.concat([Buffer.from([0x04]), pbw]);
 const ws = new WebSocket(`ws://${phone}:9000/`);
@@ -127,4 +153,3 @@ Protocol notes:
 - Wait for server message type `0x07` (`07ff` means watch connected).
 - Send one binary frame containing byte `0x04` followed by the PBW bytes.
 - Install result is server message type `0x05`; little-endian status `0` means success.
-

@@ -46,6 +46,7 @@ var KEY_NAME = "name";
 var KEY_MODEL = "model";
 var KEY_INSTANCE_ID = "instance_id";
 var KEY_IS_DEFAULT = "is_default";
+var KEY_C_MONITOR = "c_monitor";
 
 var CMD_REFRESH = 1;
 var CMD_SESSION_ITEM = 2;
@@ -69,12 +70,13 @@ var CMD_CONCIERGE = 19;
 var CMD_MODEL_REQUEST = 20;
 var CMD_MODEL_ITEM = 21;
 var CMD_MODEL_END = 22;
+var CMD_PROJECT_DELETE = 23;
 var CMD_SCREENSHOT_PAGE = 90;
 
 var SCOPE_ACTIVE = 0;
 var SCOPE_SETTLED = 1;
 
-var BUILD_LABEL = "v0.10";
+var BUILD_LABEL = "v0.20";
 // @generated protocol:end
 
 var MAX_SESSIONS = 20;
@@ -111,8 +113,8 @@ var ID_SEPARATOR = "::";
 // threads with empty bodies, so thread detail is fetched per thread.
 // The shell route carries hasPendingApprovals / hasPendingUserInput /
 // hasActionableProposedPlan / settledOverride / pinnedAt / latestUserMessageAt,
-// which is everything the settled classification needs. One request per host,
-// no per-thread hydration.
+// which is the persisted half of settled classification. Live PR state is
+// layered on below through vcs.refreshStatus. No per-thread body hydration.
 var T3_SHELL_PATH = "/api/orchestration/shell";
 var T3_THREAD_PATH = "/api/orchestration/threads/";
 var T3_DISPATCH_PATH = "/api/orchestration/dispatch";
@@ -128,6 +130,11 @@ var CONTEXT_TURN_LIMIT = 40;
 var MAX_MODEL_CHOICES = 24;
 var MODEL_CONFIG_CACHE_MS = 5 * 60 * 1000;
 var MODEL_CONFIG_TIMEOUT_MS = 12000;
+// T3's sidebar folds live pull-request state into settlement. Refresh every
+// host's relevant checkouts over one ticketed socket, alongside the minute
+// shell poll; a VCS timeout is optional metadata and must never make the host
+// itself read offline.
+var VCS_STATUS_TIMEOUT_MS = 8000;
 // New threads inherit whatever the project's default is on the server. This
 // is only used when a project carries no default at all.
 var FALLBACK_MODEL_SELECTION = { instanceId: "codex", model: "gpt-5.6-sol" };
@@ -136,7 +143,10 @@ var DEFAULT_SETTINGS = {
   nextServerId: 1,
   // Days of quiet before a thread settles on its own, matching T3's own
   // setting. null means never, which is what T3 does when the option is off.
-  autoSettleAfterDays: 3
+  autoSettleAfterDays: 3,
+  // Matches T3's sidebarAutoSettleOnMerge default. Closed PRs settle
+  // regardless; this flag controls merged PRs only.
+  autoSettleOnMerge: true
 };
 // The screenshot storyboard below is phone-side only and unreachable on a
 // handset (there is no `process`), so it costs bundle size and nothing else.
@@ -144,7 +154,11 @@ var DEFAULT_SETTINGS = {
 // rearrange a shipped app's window stack -- is behind SCREENSHOT_BUILD in
 // main.c and is not in the released binary.
 var SCREENSHOT_FIXTURES = typeof process !== "undefined" && process.env &&
-  process.env.T3PEBBLE_SCREENSHOT_FIXTURES === "1";
+  process.env.P3_SCREENSHOT_FIXTURES === "1";
+
+var SETTINGS_KEY = "p3_settings";
+var BUILD_LABEL_KEY = "p3_build_label";
+var LEGACY_SETTINGS_KEY = "t3pebble_settings";
 
 var appMessageQueue = [];
 var appMessageBusy = false;
@@ -153,6 +167,14 @@ var pendingBySession = {};
 var lastSnapshot = null;
 var shellByServer = {};
 var modelConfigByServer = {};
+// Remember the page the watch most recently opened on each host. A project
+// create completes asynchronously, and refreshing that same page is what
+// makes the new project visible without moving a settled-list user elsewhere.
+var hostViewByServer = {};
+// T3 keeps terminal PR snapshots above sidebar rows so a local checkout that
+// moves back to the default branch does not make a just-merged thread jump
+// back into the active bucket. The phone needs the same small memory.
+var changeRequestByThread = {};
 // What was last sent for each host, so an unchanged roll-up costs no radio
 // time. A quiet tailnet used to spend one acknowledged AppMessage per host
 // every five minutes restating numbers the watch already had.
@@ -180,7 +202,7 @@ var settingsCacheValue = null;
 
 function settings() {
   migrateSettings();
-  var raw = localStorage.getItem("t3pebble_settings");
+  var raw = localStorage.getItem(SETTINGS_KEY);
   if (settingsCacheValue !== null && raw === settingsCacheRaw) {
     return settingsCacheValue;
   }
@@ -233,7 +255,14 @@ function normalizeSettings(parsed) {
   }
   var window = normalizeAutoSettleDays(parsed && parsed.autoSettleAfterDays);
   autoSettleAfterDays = window;
-  return { servers: servers, nextServerId: nextId, autoSettleAfterDays: window };
+  var settleOnMerge = !parsed || parsed.autoSettleOnMerge !== false;
+  autoSettleOnMerge = settleOnMerge;
+  return {
+    servers: servers,
+    nextServerId: nextId,
+    autoSettleAfterDays: window,
+    autoSettleOnMerge: settleOnMerge
+  };
 }
 
 // T3 accepts 1 to 90 days or the option turned off; anything else is settings
@@ -275,10 +304,10 @@ function normalizeServer(server) {
 }
 
 function migrateSettings() {
-  if (localStorage.getItem("t3pebble_build_label") === BUILD_LABEL) {
+  if (localStorage.getItem(BUILD_LABEL_KEY) === BUILD_LABEL) {
     return;
   }
-  var raw = localStorage.getItem("t3pebble_settings");
+  var raw = localStorage.getItem(SETTINGS_KEY) || localStorage.getItem(LEGACY_SETTINGS_KEY);
   var migrated = null;
   if (raw) {
     try {
@@ -299,8 +328,8 @@ function migrateSettings() {
       migrated = null;
     }
   }
-  localStorage.setItem("t3pebble_build_label", BUILD_LABEL);
-  localStorage.setItem("t3pebble_settings", JSON.stringify(migrated || DEFAULT_SETTINGS));
+  localStorage.setItem(BUILD_LABEL_KEY, BUILD_LABEL);
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(migrated || DEFAULT_SETTINGS));
 }
 
 function copySettings(source) {
@@ -313,16 +342,17 @@ function saveSettings(next) {
   // id resolve to a different machine.
   var previous = 1;
   try {
-    previous = parseInt(JSON.parse(localStorage.getItem("t3pebble_settings")).nextServerId, 10) || 1;
+    previous = parseInt(JSON.parse(localStorage.getItem(SETTINGS_KEY)).nextServerId, 10) || 1;
   } catch (e) {
     previous = 1;
   }
   var normalized = normalizeSettings({
     servers: (next && next.servers) || [],
     nextServerId: previous,
-    autoSettleAfterDays: next ? next.autoSettleAfterDays : undefined
+    autoSettleAfterDays: next ? next.autoSettleAfterDays : undefined,
+    autoSettleOnMerge: next ? next.autoSettleOnMerge : undefined
   });
-  localStorage.setItem("t3pebble_settings", JSON.stringify(normalized));
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalized));
 }
 
 function configuredServers() {
@@ -782,6 +812,200 @@ function fetchServerConfig(server, callback) {
   });
 }
 
+// One non-streaming VCS request per distinct checkout, multiplexed over a
+// single authenticated socket. A failed request is omitted from the result so
+// callers can retain their previous PR snapshot, as T3's sidebar does when a
+// live status sample is temporarily unavailable.
+function fetchVcsStatuses(server, cwds, callback) {
+  if (!cwds.length) {
+    callback(null, {});
+    return;
+  }
+  if (typeof WebSocket === "undefined") {
+    callback(new Error("Phone WebSocket unavailable"), {});
+    return;
+  }
+  httpRequest(server, "POST", T3_WEBSOCKET_TICKET_PATH, null, function(ticketError, issued) {
+    if (ticketError || !issued || !issued.ticket) {
+      callback(ticketError || new Error("T3 did not issue a WebSocket ticket"), {});
+      return;
+    }
+    var done = false;
+    var socket;
+    var timer;
+    var pending = cwds.length;
+    var cwdByRequest = {};
+    var completed = {};
+    var statuses = {};
+
+    function finish(error) {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch (e) {
+        void e;
+      }
+      callback(error, statuses);
+    }
+
+    try {
+      socket = new WebSocket(webSocketUrl(server, issued.ticket));
+      timer = setTimeout(function() {
+        finish(new Error("T3 VCS status timed out"));
+      }, VCS_STATUS_TIMEOUT_MS);
+      socket.onopen = function() {
+        for (var i = 0; i < cwds.length; i++) {
+          var requestId = i + 1;
+          cwdByRequest[requestId] = cwds[i];
+          socket.send(JSON.stringify({
+            _tag: "Request",
+            id: requestId,
+            tag: "vcs.refreshStatus",
+            payload: { cwd: cwds[i] },
+            headers: []
+          }));
+        }
+      };
+      socket.onmessage = function(event) {
+        var response;
+        try {
+          response = JSON.parse(event.data);
+        } catch (e) {
+          return;
+        }
+        var requestId = response && response.requestId;
+        if (response._tag !== "Exit" || !cwdByRequest[requestId] || completed[requestId]) {
+          return;
+        }
+        completed[requestId] = true;
+        var cwd = cwdByRequest[requestId];
+        var exit = response.exit || {};
+        if (exit._tag === "Success" && exit.value) {
+          statuses["$" + cwd] = exit.value;
+        }
+        pending--;
+        if (pending === 0) {
+          finish(null);
+        }
+      };
+      socket.onerror = function() {
+        finish(new Error("Could not load T3 VCS status"));
+      };
+      socket.onclose = function() {
+        if (!done) {
+          finish(new Error("T3 closed the VCS status request"));
+        }
+      };
+    } catch (e) {
+      finish(e);
+    }
+  });
+}
+
+function threadCheckout(snapshot, thread) {
+  if (thread.worktreePath) {
+    return thread.worktreePath;
+  }
+  var projects = (snapshot && snapshot.projects) || [];
+  for (var i = 0; i < projects.length; i++) {
+    if (projects[i].id === thread.projectId) {
+      return projects[i].workspaceRoot || "";
+    }
+  }
+  return "";
+}
+
+function retainedChangeRequest(thread, cached) {
+  if (!cached) {
+    return null;
+  }
+  // Worktrees are branch-stable, so a mismatch clears their snapshot. Local
+  // threads share a checkout; T3 retains only terminal PRs when that checkout
+  // moves away after merge/close.
+  if (thread.worktreePath) {
+    return null;
+  }
+  return cached.state === "merged" || cached.state === "closed" ? cached : null;
+}
+
+function applyChangeRequestStates(server, snapshot, statuses) {
+  var threads = (snapshot && snapshot.threads) || [];
+  var liveKeys = {};
+  for (var i = 0; i < threads.length; i++) {
+    var thread = threads[i];
+    var key = compositeId(server.id, thread.id);
+    liveKeys[key] = true;
+    delete thread.changeRequestState;
+    if (!thread.branch || thread.archivedAt || thread.deletedAt) {
+      delete changeRequestByThread[key];
+      continue;
+    }
+    var cwd = threadCheckout(snapshot, thread);
+    var status = cwd ? statuses["$" + cwd] : null;
+    var cached = changeRequestByThread[key];
+    if (status) {
+      if (status.refName === thread.branch && status.pr) {
+        cached = { branch: thread.branch, state: status.pr.state };
+        changeRequestByThread[key] = cached;
+      } else {
+        cached = retainedChangeRequest(thread, cached);
+        if (cached) {
+          changeRequestByThread[key] = cached;
+        } else {
+          delete changeRequestByThread[key];
+        }
+      }
+    }
+    // No fresh sample means "leave the map alone" in T3. A worktree snapshot
+    // still has to match its thread branch; local terminal snapshots survive a
+    // shared checkout moving back to main.
+    cached = changeRequestByThread[key];
+    if (cached && (!thread.worktreePath || cached.branch === thread.branch)) {
+      thread.changeRequestState = cached.state;
+    }
+  }
+  var prefix = server.id + ID_SEPARATOR;
+  for (var cachedKey in changeRequestByThread) {
+    if (changeRequestByThread.hasOwnProperty(cachedKey) &&
+        cachedKey.indexOf(prefix) === 0 && !liveKeys[cachedKey]) {
+      delete changeRequestByThread[cachedKey];
+    }
+  }
+}
+
+function enrichShellChangeRequests(server, snapshot, callback) {
+  var seen = {};
+  var cwds = [];
+  var threads = (snapshot && snapshot.threads) || [];
+  for (var i = 0; i < threads.length; i++) {
+    var thread = threads[i];
+    if (!thread.branch || thread.archivedAt || thread.deletedAt) {
+      continue;
+    }
+    var cwd = threadCheckout(snapshot, thread);
+    if (cwd && !seen["$" + cwd]) {
+      seen["$" + cwd] = true;
+      cwds.push(cwd);
+    }
+  }
+  if (!cwds.length) {
+    applyChangeRequestStates(server, snapshot, {});
+    callback(snapshot);
+    return;
+  }
+  fetchVcsStatuses(server, cwds, function(error, statuses) {
+    // PR state is a classification refinement, not host reachability. Retain
+    // the last snapshots on failure and continue with the shell response.
+    void error;
+    applyChangeRequestStates(server, snapshot, statuses || {});
+    callback(snapshot);
+  });
+}
+
 // Fans out across every configured server and folds the replies into one
 // snapshot shaped exactly like the single-server one, with ids namespaced by
 // server. Everything downstream stays server-agnostic.
@@ -1019,6 +1243,7 @@ function makeMessage(command, fields) {
     message[KEY_C_RUN] = fields.counts.run;
     message[KEY_C_IDLE] = fields.counts.idle;
     message[KEY_C_SETTLED] = fields.counts.settled;
+    message[KEY_C_MONITOR] = fields.counts.monitor || 0;
   }
   return message;
 }
@@ -1054,6 +1279,7 @@ var DAY_MS = 24 * 60 * 60 * 1000;
 // refreshes it, and every poll reads the settings for its server list, so the
 // cache cannot outlive a settings change by more than one cycle.
 var autoSettleAfterDays = DEFAULT_AUTO_SETTLE_AFTER_DAYS;
+var autoSettleOnMerge = true;
 
 function parseTime(value) {
   if (!value) {
@@ -1208,6 +1434,16 @@ function effectiveSettled(thread, nowMs, queuedTurnStart) {
   if (thread.settledOverride === "active") {
     return false;
   }
+  var changeRequestState = thread.changeRequestState;
+  if (changeRequestState === "closed" ||
+      (changeRequestState === "merged" && autoSettleOnMerge)) {
+    return true;
+  }
+  // T3 treats an open PR as unfinished business: inactivity alone must not
+  // hide work that is still in review.
+  if (changeRequestState === "open") {
+    return false;
+  }
   if (autoSettleAfterDays === null) {
     return false;
   }
@@ -1271,6 +1507,9 @@ function threadState(thread, nowMs) {
   if (thread.backgroundLiveness === "working") {
     return "run";
   }
+  if (thread.backgroundLiveness === "monitoring") {
+    return "monitor";
+  }
   return "idle";
 }
 
@@ -1320,6 +1559,9 @@ function threadDetailLine(thread, state, nowMs, waitingSince) {
       return compact(progress.step, 34);
     }
     return "running";
+  }
+  if (state === "monitor") {
+    return "monitoring";
   }
   if (state === "err") {
     return "error";
@@ -1383,12 +1625,32 @@ function threadCreatedAt(thread) {
   return thread.createdAt;
 }
 
+// T3 renders pinned rows as a block above the ordinary inbox. User-arranged
+// keys sort lexically first; older/keyless servers fall back to newest-created
+// order at the bottom of that block.
+function sortPinnedThreads(threads) {
+  var keyed = [];
+  var keyless = [];
+  for (var i = 0; i < threads.length; i++) {
+    (threads[i].pinOrderKey !== null && threads[i].pinOrderKey !== undefined ? keyed : keyless)
+      .push(threads[i]);
+  }
+  keyed.sort(function(left, right) {
+    var leftKey = left.pinOrderKey;
+    var rightKey = right.pinOrderKey;
+    return leftKey < rightKey ? -1 : (leftKey > rightKey ? 1 : compareStrings(left.id, right.id));
+  });
+  keyless.sort(byTimeDescending(threadCreatedAt));
+  return keyed.concat(keyless);
+}
+
 // Both scopes in one pass, plus the state each thread landed in. A screen needs
 // the list it is showing AND the size of the one it is not, and working those
 // out separately meant classifying every thread twice -- threadState() is
 // several Date.parse calls deep. Doing it once also guarantees the two answers
 // agree about the clock, which two calls a millisecond apart do not.
 function partitionByScope(snapshot, nowMs) {
+  var pinned = [];
   var active = [];
   var resting = [];
   var stateById = {};
@@ -1399,13 +1661,19 @@ function partitionByScope(snapshot, nowMs) {
     stateById[thread.id] = state;
     if (isRestingState(state)) {
       resting.push(thread);
+    } else if (thread.pinnedAt) {
+      pinned.push(thread);
     } else {
       active.push(thread);
     }
   }
   active.sort(byTimeDescending(threadCreatedAt));
   resting.sort(byTimeDescending(settledTimestamp));
-  return { active: active, resting: resting, stateById: stateById };
+  return {
+    active: sortPinnedThreads(pinned).concat(active),
+    resting: resting,
+    stateById: stateById
+  };
 }
 
 function threadsForScope(snapshot, scope, nowMs) {
@@ -1765,7 +2033,7 @@ function toPebbleMessage(message) {
 // me? Everything it needs comes from the single shell request per host.
 
 function rollupForThreads(threads, nowMs) {
-  var counts = { needs: 0, run: 0, err: 0, idle: 0, settled: 0, snooze: 0 };
+  var counts = { needs: 0, run: 0, err: 0, monitor: 0, idle: 0, settled: 0, snooze: 0 };
   counts.total = 0;
   for (var i = 0; i < threads.length; i++) {
     if (threads[i].deletedAt || threads[i].archivedAt) {
@@ -1782,6 +2050,7 @@ function hostStateFromCounts(counts) {
   if (counts.needs > 0) return "needs";
   if (counts.run > 0) return "run";
   if (counts.err > 0) return "err";
+  if (counts.monitor > 0) return "monitor";
   if (counts.idle > 0) return "idle";
   if (counts.total > 0) return "settled";
   return "empty";
@@ -1791,6 +2060,7 @@ function hostDetailLine(state, counts) {
   if (state === "needs") return counts.needs + " need you";
   if (state === "run") return counts.run + " running";
   if (state === "err") return counts.err + " in error";
+  if (state === "monitor") return counts.monitor + " monitoring";
   // "Idle" is the answer to "what needs me to start it": active threads with
   // nothing actually running.
   if (state === "idle") return counts.idle + " idle";
@@ -1829,30 +2099,33 @@ function refreshHosts(afterCurrent) {
           // the sentence rather than the fragment that fit beside a readout.
           detail: compact(String(error.message || error), HOST_FAILURE_LIMIT),
           transport: !!error.transport,
-          counts: { needs: 0, run: 0, idle: 0, settled: 0 }
+          counts: { needs: 0, run: 0, monitor: 0, idle: 0, settled: 0 }
         };
         next();
         return;
       }
-      var entry = cacheShell(server, snapshot);
-      // Avoid allocating a filtered copy solely for a one-pass roll-up.
-      // rollupForThreads skips archived/deleted rows itself.
-      var threads = entry.raw && entry.raw.threads ? entry.raw.threads : [];
-      var counts = rollupForThreads(threads, nowMs);
-      var state = hostStateFromCounts(counts);
-      rows[index] = {
-        id: server.id,
-        title: server.label,
-        state: state,
-        detail: hostDetailLine(state, counts),
-        counts: {
-          needs: counts.needs,
-          run: counts.run,
-          idle: counts.idle + counts.err,
-          settled: counts.settled + counts.snooze
-        }
-      };
-      next();
+      enrichShellChangeRequests(server, snapshot, function(enriched) {
+        var entry = cacheShell(server, enriched);
+        // Avoid allocating a filtered copy solely for a one-pass roll-up.
+        // rollupForThreads skips archived/deleted rows itself.
+        var threads = entry.raw && entry.raw.threads ? entry.raw.threads : [];
+        var counts = rollupForThreads(threads, nowMs);
+        var state = hostStateFromCounts(counts);
+        rows[index] = {
+          id: server.id,
+          title: server.label,
+          state: state,
+          detail: hostDetailLine(state, counts),
+          counts: {
+            needs: counts.needs,
+            run: counts.run,
+            monitor: counts.monitor,
+            idle: counts.idle + counts.err,
+            settled: counts.settled + counts.snooze
+          }
+        };
+        next();
+      });
     }, HOST_PROBE_TIMEOUT_MS);
   }, function() {
     // Log the reason, not just the name: "rejected the token" and "no route"
@@ -1929,6 +2202,7 @@ function selectHost(hostId, scope, offset) {
   var server = serverById(hostId);
   scope = scope === SCOPE_SETTLED ? SCOPE_SETTLED : SCOPE_ACTIVE;
   offset = offset > 0 ? offset : 0;
+  hostViewByServer[hostId] = { scope: scope, offset: offset };
   if (!server) {
     sendError("Unknown host");
     send(makeMessage(CMD_SESSION_END, { total: 0, scope: scope, offset: 0, matched: 0 }));
@@ -1983,7 +2257,9 @@ function selectHost(hostId, scope, offset) {
       send(makeMessage(CMD_SESSION_END, { total: 0 }));
       return;
     }
-    emit(taggedShell(cacheShell(server, snapshot)));
+    enrichShellChangeRequests(server, snapshot, function(enriched) {
+      emit(taggedShell(cacheShell(server, enriched)));
+    });
   });
 }
 
@@ -1995,7 +2271,7 @@ var FIXTURE_HOSTS = [
     title: "WORKBENCH",
     detail: "2 need you",
     state: "needs",
-    counts: { needs: 2, run: 1, idle: 3, settled: 8 }
+    counts: { needs: 2, run: 1, monitor: 2, idle: 3, settled: 8 }
   },
   {
     id: "shot-host-lab",
@@ -2078,7 +2354,7 @@ var FIXTURE_SETTLED_SESSIONS = [
 ];
 
 var FIXTURE_PROJECTS = [
-  { id: "shot-host-main::project-watch", title: "t3pebble", directory: "~/Projects/t3pebble" },
+  { id: "shot-host-main::project-watch", title: "p3code", directory: "~/Projects/p3code" },
   { id: "shot-host-main::project-lab", title: "watch-lab", directory: "~/Projects/watch-lab" }
 ];
 
@@ -2183,6 +2459,27 @@ function runScreenshotStoryboard() {
   setTimeout(function() {
     sendScreenshotPage(5);
   }, 19600);
+  setTimeout(function() {
+    fixtureSelectHost(FIXTURE_HOSTS[0].id, SCOPE_SETTLED, 0);
+  }, 22800);
+  setTimeout(function() {
+    sendScreenshotPage(6);
+  }, 23500);
+  setTimeout(function() {
+    fixtureSelectHost(FIXTURE_HOSTS[0].id, SCOPE_ACTIVE, 0);
+  }, 26800);
+  setTimeout(function() {
+    sendScreenshotPage(7);
+  }, 27500);
+  setTimeout(function() {
+    sendScreenshotPage(8);
+  }, 31500);
+  setTimeout(function() {
+    sendScreenshotPage(9);
+  }, 35500);
+  setTimeout(function() {
+    sendScreenshotPage(10);
+  }, 39500);
 }
 
 
@@ -2867,6 +3164,80 @@ function projectPathFor(server, name) {
   return server.projectRoot + "/" + slug;
 }
 
+// A pasted setup line predates the project-root field on many phones. In that
+// case, existing projects still tell us where this host keeps its checkouts.
+// Use their common parent, but never guess the filesystem root itself.
+function inferredProjectRoot(snapshot) {
+  var projects = (snapshot && snapshot.projects) || [];
+  var common = null;
+  for (var i = 0; i < projects.length; i++) {
+    var project = projects[i];
+    if (!project || project.deletedAt || !project.workspaceRoot) {
+      continue;
+    }
+    var path = trim(project.workspaceRoot).replace(/\/+$/, "");
+    var slash = path.lastIndexOf("/");
+    if (path.charAt(0) !== "/" || slash <= 0) {
+      continue;
+    }
+    var parent = path.slice(0, slash);
+    if (common === null) {
+      common = parent;
+      continue;
+    }
+    while (common && parent !== common && parent.indexOf(common + "/") !== 0) {
+      common = common.slice(0, common.lastIndexOf("/"));
+    }
+  }
+  return common && common !== "/" ? common : "";
+}
+
+function projectRootForHost(server) {
+  if (server.projectRoot) {
+    return server.projectRoot;
+  }
+  var cached = shellByServer[server.id];
+  return inferredProjectRoot(cached && cached.raw);
+}
+
+function resolveProjectRoot(server, callback) {
+  var root = projectRootForHost(server);
+  if (root) {
+    callback(null, root);
+    return;
+  }
+
+  function resolveServerCwd() {
+    fetchServerConfig(server, function(configError, config) {
+      var cwd = !configError && config ? trim(config.cwd).replace(/\/+$/, "") : "";
+      callback(null, cwd && cwd.charAt(0) === "/" && cwd !== "/" ? cwd : "");
+    });
+  }
+
+  // An empty cached shell is meaningful: this is a fresh server, so there is
+  // no reason to read the same empty project list a second time.
+  if (shellByServer[server.id]) {
+    resolveServerCwd();
+    return;
+  }
+  httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
+    if (error) {
+      callback(error, "");
+      return;
+    }
+    cacheShell(server, snapshot);
+    var inferred = inferredProjectRoot(snapshot);
+    if (inferred) {
+      callback(null, inferred);
+      return;
+    }
+    // A truly fresh server has no projects to learn from. Stock T3 exposes
+    // the directory it was launched in through server.getConfig; that is the
+    // natural container for its first watch-created project.
+    resolveServerCwd();
+  });
+}
+
 // Step one: resolve the dictated name to an absolute path and hand it back for
 // confirmation. Nothing is created until the watch sends it to CMD_PROJECT_CREATE.
 function previewProject(hostId, name) {
@@ -2875,20 +3246,26 @@ function previewProject(hostId, name) {
     sendError("Unknown host");
     return;
   }
-  if (!server.projectRoot) {
-    sendError("Set a project root in settings");
-    return;
-  }
-  var path = projectPathFor(server, name);
-  if (!path) {
-    sendError("Could not read a project name");
-    return;
-  }
-  send(makeMessage(CMD_PROJECT_PREVIEW, {
-    hostId: hostId,
-    name: compact(trim(name), 40),
-    path: path
-  }));
+  resolveProjectRoot(server, function(error, projectRoot) {
+    if (error) {
+      sendError(error);
+      return;
+    }
+    if (!projectRoot) {
+      sendError("Set a project root in settings");
+      return;
+    }
+    var path = projectPathFor({ projectRoot: projectRoot }, name);
+    if (!path) {
+      sendError("Could not read a project name");
+      return;
+    }
+    send(makeMessage(CMD_PROJECT_PREVIEW, {
+      hostId: hostId,
+      name: compact(trim(name), 40),
+      path: path
+    }));
+  });
 }
 
 // Step two: the user approved the path shown on the glass, so create it. The
@@ -2900,7 +3277,7 @@ function createProject(hostId, name, path) {
     sendError("Unknown host");
     return;
   }
-  var workspaceRoot = trim(path) || projectPathFor(server, name);
+  var workspaceRoot = trim(path) || projectPathFor({ projectRoot: projectRootForHost(server) }, name);
   if (!workspaceRoot) {
     sendError("No project path");
     return;
@@ -2920,7 +3297,35 @@ function createProject(hostId, name, path) {
       return;
     }
     shellByServer[hostId] = null;
-    send(makeMessage(CMD_PROMPT, {}));
+    var view = hostViewByServer[hostId] || { scope: SCOPE_ACTIVE, offset: 0 };
+    send(makeMessage(CMD_STATUS, { status: "Project created" }));
+    selectHost(hostId, view.scope, view.offset);
+  });
+}
+
+function deleteProject(projectId) {
+  var parts = splitCompositeId(projectId);
+  var server = serverById(parts.serverId);
+  if (!server || !parts.nativeId) {
+    sendError("Unknown project");
+    return;
+  }
+  dispatchCommand(server, {
+    type: "project.delete",
+    commandId: randomId("pebble:proj-delete:"),
+    projectId: parts.nativeId,
+    // T3 protects non-empty projects unless force is explicit. Project removal
+    // in its clients means removing the project and its threads together.
+    force: true
+  }, function(error) {
+    if (error) {
+      sendError(error);
+      return;
+    }
+    shellByServer[parts.serverId] = null;
+    var view = hostViewByServer[parts.serverId] || { scope: SCOPE_ACTIVE, offset: 0 };
+    send(makeMessage(CMD_STATUS, { status: "Project deleted" }));
+    selectHost(parts.serverId, view.scope, view.offset);
   });
 }
 
@@ -2976,7 +3381,7 @@ function settleSession(sessionId, settled) {
 }
 
 function promptSession(sessionId, text) {
-  var instruction = "This message was sent from the user's Pebble watch through t3pebble. The user can open the full response, but they will mostly read the ending on the watch. End your reply with the last five sentences as a useful Pebble summary of what you did and what, if anything, you need from the user.";
+  var instruction = "This message was sent from the user's Pebble watch through P3. The user can open the full response, but they will mostly read the ending on the watch. End your reply with the last five sentences as a useful Pebble summary of what you did and what, if anything, you need from the user.";
   var prompt = text + "\n\n" + instruction;
   withThread(sessionId, function(error, thread) {
     if (error || !thread) {
@@ -3017,7 +3422,7 @@ function promptNewThread(projectId, text, instanceId, model) {
     sendError("No new thread prompt");
     return;
   }
-  var instruction = "This message was sent from the user's Pebble watch through t3pebble. The user can open the full response, but they will mostly read the ending on the watch. End your reply with the last five sentences as a useful Pebble summary of what you did and what, if anything, you need from the user.";
+  var instruction = "This message was sent from the user's Pebble watch through P3. The user can open the full response, but they will mostly read the ending on the watch. End your reply with the last five sentences as a useful Pebble summary of what you did and what, if anything, you need from the user.";
   var prompt = text + "\n\n" + instruction;
   withProject(projectId, function(error, project) {
     if (error || !project) {
@@ -3149,8 +3554,10 @@ function invalidateHost(compositeId) {
   }
 }
 
-// One pasteable line per machine, as printed by run-t3code-tailscale.sh:
-//   t3pebble1|<label>|<base URL>|<token>
+// One pasteable line per machine, as printed by run-p3-tailscale.sh:
+//   p3code1|<label>|<base URL>|<token>
+// Legacy t3pebble1 lines remain valid so an old launcher output can still be
+// pasted after upgrading the app.
 // Deliberately free of helper calls: configurationHtml() embeds this function's
 // own source into the settings page, so the page parses by exactly these rules.
 function parseServerBundle(text) {
@@ -3158,10 +3565,12 @@ function parseServerBundle(text) {
   var lines = String(text === null || text === undefined ? "" : text).split(/[\r\n]+/);
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i].replace(/^\s+|\s+$/g, "");
-    if (line.indexOf("t3pebble1|") !== 0) {
+    var prefix = line.indexOf("p3code1|") === 0 ? "p3code1|" :
+      (line.indexOf("t3pebble1|") === 0 ? "t3pebble1|" : "");
+    if (!prefix) {
       continue;
     }
-    var parts = line.slice(10).split("|");
+    var parts = line.slice(prefix.length).split("|");
     if (parts.length < 3) {
       continue;
     }
@@ -3199,18 +3608,19 @@ function configurationHtml() {
     "input,textarea{box-sizing:border-box;width:100%;font-size:16px;padding:10px;border:1px solid #999;border-radius:6px}",
     "textarea{font-family:ui-monospace,Menlo,monospace;font-size:13px}",
     "code{font-size:12px;background:#eee;padding:1px 4px;border-radius:3px}",
+    ".check{display:flex;align-items:center;gap:8px}.check input{width:auto;margin:0}",
     ".card{background:#fff;border:1px solid #ddd;border-radius:10px;padding:14px;margin-top:14px}",
     ".card h3{margin:0;font-size:15px}.head{display:flex;justify-content:space-between;align-items:center}",
     ".rm{width:auto;margin:0;padding:6px 10px;font-size:13px;background:#c0392b}",
     "button{margin-top:18px;width:100%;font-size:17px;padding:12px;border:0;border-radius:6px;background:#111;color:white}",
     ".add{background:#2d6cdf}p.hint{margin:6px 0 0;font-size:13px;color:#555}</style></head><body>",
-    "<h2>T3 Pebble</h2>",
+    "<h2>P3</h2>",
     "<p class='hint'>Add one entry per machine running T3 Code. The label is what the watch shows.</p>",
     "<div class='card'><h3>Quick setup</h3>",
-    "<p class='hint'>Run <code>run-t3code-tailscale.sh</code> on each machine and paste the ",
-    "<code>t3pebble1|...</code> lines it prints. One line per machine; pasting a line again ",
+    "<p class='hint'>Run <code>run-p3-tailscale.sh</code> on each machine and paste the ",
+    "<code>p3code1|...</code> lines it prints. One line per machine; pasting a line again ",
     "refreshes that machine's token instead of adding a duplicate.</p>",
-    "<textarea id='bundle' rows='4' placeholder='t3pebble1|beta1|https://beta1.tailnet.ts.net|token'></textarea>",
+    "<textarea id='bundle' rows='4' placeholder='p3code1|beta1|https://beta1.tailnet.ts.net|token'></textarea>",
     "<button class='add' onclick='addFromPaste()'>Add from paste</button>",
     "<p class='hint' id='pasteMsg'></p></div>",
     "<div id='servers'></div>",
@@ -3226,7 +3636,11 @@ function configurationHtml() {
     current.autoSettleAfterDays === null ? "" : String(current.autoSettleAfterDays), "'>",
     "<p class='hint'>Days, or blank for never. Match this to T3 Code's own setting ",
     "(Settings, then <code>Days of inactivity before auto-settle</code>) or the watch and ",
-    "the desktop will disagree about which threads are done.</p></div>",
+    "the desktop will disagree about which threads are done.</p>",
+    "<label class='check'><input id='autoSettleMerge' type='checkbox' ",
+    current.autoSettleOnMerge ? "checked" : "", "> Auto-settle merged pull requests</label>",
+    "<p class='hint'>Match T3 Code's setting. Closed pull requests settle either way, and ",
+    "open pull requests stay active even after the inactivity window.</p></div>",
     "<button onclick='save()'>Save</button>",
     "<script>",
     "var MAX=", String(MAX_SERVERS), ";",
@@ -3250,7 +3664,7 @@ function configurationHtml() {
     "servers[+e.target.getAttribute('data-i')][e.target.getAttribute('data-f')]=e.target.value;});}}",
     "function addFromPaste(){var ta=document.getElementById('bundle');var msg=document.getElementById('pasteMsg');",
     "var found=parseServerBundle(ta.value);",
-    "if(!found.length){msg.textContent='No setup lines found. Paste the t3pebble1|... line.';return;}",
+    "if(!found.length){msg.textContent='No setup lines found. Paste the p3code1|... line.';return;}",
     "if(servers.length===1&&!servers[0].baseUrl&&!servers[0].token){servers=[];}",
     "var added=0,updated=0,skipped=0;",
     "for(var i=0;i<found.length;i++){var f=found[i];var hit=-1;",
@@ -3267,7 +3681,8 @@ function configurationHtml() {
     "function autoSettleValue(){var raw=document.getElementById('autoSettle').value;",
     "if(!String(raw).trim()){return null;}var n=parseInt(raw,10);return isNaN(n)?null:n;}",
     "function save(){location.href='pebblejs://close#'+encodeURIComponent(JSON.stringify(",
-    "{servers:servers,autoSettleAfterDays:autoSettleValue()}));}",
+    "{servers:servers,autoSettleAfterDays:autoSettleValue(),",
+    "autoSettleOnMerge:document.getElementById('autoSettleMerge').checked}));}",
     "render();",
     "</script></body></html>"
   ].join("");
@@ -3301,6 +3716,8 @@ Pebble.addEventListener("appmessage", function(event) {
     previewProject(message[KEY_HOST_ID], trim(message[KEY_NAME]));
   } else if (command === CMD_PROJECT_CREATE) {
     createProject(message[KEY_HOST_ID], trim(message[KEY_NAME]), trim(message[KEY_PATH]));
+  } else if (command === CMD_PROJECT_DELETE) {
+    deleteProject(message[KEY_PROJECT_ID]);
   } else if (command === CMD_CONCIERGE) {
     conciergeProject(message[KEY_HOST_ID], trim(message[KEY_PROMPT]));
   } else if (command === CMD_MODEL_REQUEST) {
@@ -3329,6 +3746,8 @@ Pebble.addEventListener("webviewclosed", function(event) {
     saveSettings(JSON.parse(decodeURIComponent(event.response)));
     shellByServer = {};
     modelConfigByServer = {};
+    changeRequestByThread = {};
+    hostViewByServer = {};
     // A host may have been added, removed or relabelled, so nothing the watch
     // is holding can be assumed still current.
     lastHostRow = {};

@@ -6,9 +6,9 @@ set -euo pipefail
 # published `t3` CLI and the REST orchestration API the phone bridge uses.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PEBBLE_DIR="$ROOT_DIR/pebblecode"
+PEBBLE_DIR="$ROOT_DIR/p3"
 DIST_DIR="$ROOT_DIR/dist"
-SMOKE_BASE_DIR="${SMOKE_BASE_DIR:-$(mktemp -d /tmp/t3pebble-smoke.XXXXXX)}"
+SMOKE_BASE_DIR="${SMOKE_BASE_DIR:-$(mktemp -d /tmp/p3-smoke.XXXXXX)}"
 
 SERVER_PID=""
 
@@ -57,12 +57,12 @@ node test/bridge.integration.test.js
 pebble build
 
 mkdir -p "$DIST_DIR"
-cp "$PEBBLE_DIR/build/pebblecode.pbw" "$DIST_DIR/t3pebble.pbw"
+cp "$PEBBLE_DIR/build/p3.pbw" "$DIST_DIR/p3.pbw"
 
 SMOKE_TOKEN="$("${T3[@]}" auth session issue \
   --base-dir "$SMOKE_BASE_DIR" \
   --ttl 15m \
-  --label "t3pebble smoke" \
+  --label "p3 smoke" \
   --token-only | tr -d '[:space:]')"
 
 if [[ -z "$SMOKE_TOKEN" ]]; then
@@ -75,7 +75,7 @@ fi
   --port "$SMOKE_PORT" \
   --no-browser \
   --base-dir "$SMOKE_BASE_DIR" \
-  >/tmp/t3pebble-smoke.log 2>&1 &
+  >/tmp/p3-smoke.log 2>&1 &
 SERVER_PID="$!"
 
 SMOKE_BASE_URL="http://127.0.0.1:$SMOKE_PORT"
@@ -92,7 +92,7 @@ done
 
 if [[ "$ready" != "1" ]]; then
   echo "T3 Code smoke server did not become ready on $SMOKE_BASE_URL." >&2
-  cat /tmp/t3pebble-smoke.log >&2 || true
+  cat /tmp/p3-smoke.log >&2 || true
   exit 1
 fi
 
@@ -107,19 +107,19 @@ fi
 curl --max-time 10 -sS \
   -H "Authorization: Bearer $SMOKE_TOKEN" \
   -H "Accept: application/json" \
-  "$SMOKE_BASE_URL/api/orchestration/shell" >/tmp/t3pebble-smoke-snapshot.json
+  "$SMOKE_BASE_URL/api/orchestration/shell" >/tmp/p3-smoke-snapshot.json
 
 node <<'NODE'
 const fs = require("node:fs");
-const snapshot = JSON.parse(fs.readFileSync("/tmp/t3pebble-smoke-snapshot.json", "utf8"));
+const snapshot = JSON.parse(fs.readFileSync("/tmp/p3-smoke-snapshot.json", "utf8"));
 if (!Array.isArray(snapshot.projects) || !Array.isArray(snapshot.threads)) {
   console.error("Shell snapshot did not include projects and threads arrays.");
   process.exit(1);
 }
 NODE
 
-PBW_PATH="$DIST_DIR/t3pebble.pbw" \
-MANIFEST_PATH="$DIST_DIR/t3pebble.manifest.json" \
+PBW_PATH="$DIST_DIR/p3.pbw" \
+MANIFEST_PATH="$DIST_DIR/p3.manifest.json" \
 APPINFO_PATH="$PEBBLE_DIR/appinfo.json" \
 node <<'NODE'
 const crypto = require("node:crypto");
@@ -155,6 +155,6 @@ const manifest = {
 fs.writeFileSync(process.env.MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
 
-echo "Verified T3 Pebble against stock T3 Code."
-echo "Installable PBW: $DIST_DIR/t3pebble.pbw"
-echo "Manifest: $DIST_DIR/t3pebble.manifest.json"
+echo "Verified P3 against stock T3 Code."
+echo "Installable PBW: $DIST_DIR/p3.pbw"
+echo "Manifest: $DIST_DIR/p3.manifest.json"

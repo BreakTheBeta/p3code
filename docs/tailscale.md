@@ -1,4 +1,4 @@
-# Tailscale Setup For T3 Pebble
+# Tailscale Setup For P3
 
 Reference for the launch script's networking options. The [README](../README.md)
 quick start covers the common path; this covers the rest.
@@ -7,21 +7,24 @@ quick start covers the common path; this covers the rest.
 
 - `HOST` — bind address, if you do not want the Tailscale IP.
 - `PORT` — defaults to `3773`.
-- `T3PEBBLE_TOKEN` — reuse an existing token instead of minting a new one.
-- `T3PEBBLE_TOKEN_TTL` — token lifetime, defaults to `365d`.
+- `P3_TOKEN` — reuse an existing token instead of minting a new one.
+- `P3_TOKEN_TTL` — token lifetime, defaults to `365d`.
 - `T3CODE_BASE_DIR` — explicit T3 Code data directory.
 - `T3_CMD` — override how the `t3` CLI is invoked.
-- `T3PEBBLE_TAILSCALE_SERVE` — set to `1` for Tailscale Serve mode (see below).
-- `T3PEBBLE_SERVE_PORT` — HTTPS port for that mode, defaults to `443`.
-- `T3PEBBLE_LABEL` — watch label for this machine; defaults to its short
+- `P3_TAILSCALE_SERVE` — set to `1` for Tailscale Serve mode (see below).
+- `P3_SERVE_PORT` — HTTPS port for that mode, defaults to `443`.
+- `P3_LABEL` — watch label for this machine; defaults to its short
   tailnet name. The watch shows 18 characters.
-- `T3PEBBLE_PROJECT_ROOT` — where projects dictated from the watch are created
+- `P3_PROJECT_ROOT` — where projects dictated from the watch are created
   on this machine. Adds it to the paste line so it arrives with the token.
+
+The former `T3PEBBLE_*` variable names remain accepted as migration aliases;
+new scripts and documentation use `P3_*`.
 
 ## Tailscale Serve Mode (optional)
 
 ```sh
-T3PEBBLE_TAILSCALE_SERVE=1 ./run-t3code-tailscale.sh
+P3_TAILSCALE_SERVE=1 ./run-p3-tailscale.sh
 ```
 
 Instead of binding the Tailscale IP, this leaves the server on loopback and
@@ -72,10 +75,10 @@ To run it right now without installing the integration, point `PATH` at the
 bundle for the one command:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/twodotwill/t3pebble/main/run-t3code-tailscale.sh \
+curl -fsSL https://raw.githubusercontent.com/breakthebeta/p3code/main/run-p3-tailscale.sh \
   | PATH="/Applications/Tailscale.app/Contents/MacOS:$PATH" \
     TAILSCALE_BE_CLI=1 \
-    T3PEBBLE_TAILSCALE_SERVE=1 bash
+    P3_TAILSCALE_SERVE=1 bash
 ```
 
 Tailscale's [macOS CLI documentation](https://tailscale.com/docs/reference/tailscale-cli?tab=macos)

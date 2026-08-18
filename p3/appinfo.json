@@ -1,9 +1,9 @@
 {
   "uuid": "ba80eb39-3012-4936-b665-81bdee03c708",
-  "shortName": "t3pebble",
-  "longName": "T3 Pebble",
-  "companyName": "Pebble",
-  "versionLabel": "0.10",
+  "shortName": "P3",
+  "longName": "P3",
+  "companyName": "Break the Beta",
+  "versionLabel": "0.20",
   "sdkVersion": "3",
   "enableMultiJS": true,
   "targetPlatforms": [
@@ -47,10 +47,17 @@
     "name": 31,
     "model": 32,
     "instance_id": 33,
-    "is_default": 34
+    "is_default": 34,
+    "c_monitor": 35
   },
   "resources": {
     "media": [
+      {
+        "type": "png",
+        "name": "IMAGE_MENU_ICON",
+        "file": "images/menu_icon.png",
+        "menuIcon": true
+      },
       {
         "type": "font",
         "name": "FONT_DOT_20",

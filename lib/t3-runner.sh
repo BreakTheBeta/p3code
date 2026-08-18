@@ -77,7 +77,7 @@ t3_resolve() {
 
 t3_require_tailscale() {
   if ! command -v tailscale >/dev/null 2>&1; then
-    echo "tailscale is required for T3PEBBLE_TAILSCALE_SERVE=1." >&2
+    echo "tailscale is required for P3_TAILSCALE_SERVE=1." >&2
     return 1
   fi
 }
@@ -134,10 +134,10 @@ t3_default_label() {
 }
 
 # One pasteable line for the Pebble settings page. Parsed by parseServerBundle()
-# in pebblecode/src/pkjs/index.js; keep the two in step.
-t3_bundle_line() {
+# in p3/src/pkjs/index.js; keep the two in step.
+p3_bundle_line() {
   local label="$1" base_url="$2" token="$3" project_root="${4:-}"
-  printf 't3pebble1|%s|%s|%s' "${label//|/-}" "$base_url" "$token"
+  printf 'p3code1|%s|%s|%s' "${label//|/-}" "$base_url" "$token"
   # Field four is optional: where a project dictated from the watch is created.
   if [[ -n "$project_root" ]]; then
     printf '|%s' "${project_root%/}"

@@ -5,7 +5,7 @@ This is a geometry proof, not a screenshot. It draws the same rectangles at the
 same coordinates with the same font files rasterised mono at the same pixel
 sizes, so it shows whether the layout fits, overlaps or clips. What it cannot
 show is what the firmware does with those calls -- for that you need
-capture-pebble-screenshots.sh and a working emulator.
+capture-p3-screenshots.sh and a working emulator.
 
 The one knowing deviation: main.c draws its small captions in the system Gothic
 face, which is inside the firmware and not available here, so captions render
@@ -127,7 +127,7 @@ def render(out, needs, run, idle, settled, title="WORKBENCH"):
     d.rounded_rectangle([px_, py, px_ + pw - 1, py + ph - 1], 2, fill=GLASS, outline=DIM)
 
     # legend band + rails
-    draw_text(img, DOT10, 10, "T3 CODE", GLASS_PAD, 3, LEGEND)
+    draw_text(img, DOT10, 10, "P3", GLASS_PAD, 3, LEGEND)
     rw, _ = text_size(DOT10, 10, "1/3")
     draw_text(img, DOT10, 10, "1/3", W - GLASS_PAD - rw, 3, LEGEND)
     d.rectangle([7, LEGEND_H, W - 8, LEGEND_H + RAIL_H - 1], fill=RULE)

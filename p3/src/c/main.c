@@ -44,6 +44,7 @@
 #define KEY_MODEL        32
 #define KEY_INSTANCE_ID  33
 #define KEY_IS_DEFAULT   34
+#define KEY_C_MONITOR    35
 
 #define CMD_REFRESH         1
 #define CMD_SESSION_ITEM    2
@@ -67,12 +68,13 @@
 #define CMD_MODEL_REQUEST   20
 #define CMD_MODEL_ITEM      21
 #define CMD_MODEL_END       22
+#define CMD_PROJECT_DELETE  23
 #define CMD_SCREENSHOT_PAGE 90
 
 #define SCOPE_ACTIVE  0
 #define SCOPE_SETTLED 1
 
-#define BUILD_LABEL "v0.10"
+#define BUILD_LABEL "v0.20"
 /* @generated protocol:end */
 
 #define MAX_HOSTS 6
@@ -155,6 +157,7 @@ typedef struct {
   char state[10];
   int needs;
   int run;
+  int monitor;
   int idle;
   int settled;
 } HostItem;
@@ -206,7 +209,10 @@ typedef enum {
   ActionSettle,
   ActionUnsettle,
   ActionInterrupt,
+  ActionCancelProject,
   ActionCreateProject,
+  ActionCancelDelete,
+  ActionDeleteProject,
   ActionModelBase = 100
 } ActionKind;
 
@@ -267,7 +273,7 @@ typedef enum {
 
 static GSize s_seg_block[SegSizeCount];  /* "88" in each DSEG face */
 static int s_seg_digit[SegSizeCount];    /* one digit's advance, per face */
-static GSize s_seg_self_test;  /* "88:88", the power-on screen's all-segments test */
+static GSize s_seg_self_test;  /* "88", the connecting screen's all-segments test */
 
 static HostItem s_hosts[MAX_HOSTS];
 static SessionItem s_sessions[MAX_SESSIONS];
@@ -288,6 +294,7 @@ static int s_context_page_count = 1;
 static int s_pending_context_page;
 static int s_context_request_counter;
 static int s_stream_phase;
+static int s_connect_draw_second = -1;
 
 static int s_busy;
 static bool s_hosts_synced;
@@ -303,6 +310,7 @@ static uint32_t s_frame_count;
 static uint32_t s_message_in;
 static uint32_t s_message_out;
 static time_t s_launched_at;
+static time_t s_host_connect_started_at;
 
 /* Errors are kept, not flashed. The reference prints MONITOR in red beneath
    the glass; that is where a fault belongs, and the log behind it is what
@@ -334,6 +342,7 @@ static void send_prompt_text(const char *text);
 static void send_new_thread_text(const char *text);
 static void request_project_models(void);
 static void open_model_menu(void);
+static void open_project_actions(void);
 static void start_dictation(void);
 static void schedule_refresh(uint32_t delay_ms);
 static void update_stream_timer(void);
@@ -355,6 +364,15 @@ static bool busy_is(int flags) {
    definition rather than a disjunction repeated at every call site. */
 static bool busy_any(void) {
   return s_busy != 0 || !s_hosts_synced;
+}
+
+static int connecting_elapsed_seconds(void) {
+  time_t started = s_host_connect_started_at ? s_host_connect_started_at : s_launched_at;
+  int elapsed = (int)(time(NULL) - started);
+  if (elapsed < 0) {
+    return 0;
+  }
+  return elapsed > 99 ? 99 : elapsed;
 }
 
 static void log_error(const char *text) {
@@ -457,6 +475,16 @@ static GColor glass_accent(void) {
 static GColor active_color(void) {
 #ifdef PBL_COLOR
   return GColorDukeBlue;
+#else
+  return GColorBlack;
+#endif
+}
+
+/* Casio uses green as the quiet-running accent. Keep monitoring distinct from
+   active work on colour displays without giving it an animation of its own. */
+static GColor monitoring_color(void) {
+#ifdef PBL_COLOR
+  return GColorIslamicGreen;
 #else
   return GColorBlack;
 #endif
@@ -653,13 +681,17 @@ static void stream_timer_callback(void *context) {
        costs the full 8s probe timeout, which used to be 72 repaints of the
        whole screen for an animation six pixels tall.
 
-       The self-test also animates, but only on the connecting screen, which is
-       busy by definition, so it rides the same repaint. */
+       The connecting counter also updates here, but the full panel is dirtied
+       only when its displayed second changes. */
     if (s_host_rail_layer) {
       layer_mark_dirty(s_host_rail_layer);
     }
     if (!s_hosts_synced && s_host_layer) {
-      layer_mark_dirty(s_host_layer);
+      int second = connecting_elapsed_seconds();
+      if (second != s_connect_draw_second) {
+        s_connect_draw_second = second;
+        layer_mark_dirty(s_host_layer);
+      }
     }
   }
   if (thread_window_visible()) {
@@ -916,7 +948,7 @@ static void lcd_metrics_measure(void) {
   s_seg_block[SegBig] = big ? seg_text_size("88", big) : GSize(104, 64);
   s_seg_digit[SegMid] = mid ? seg_text_size("8", mid).w : s_seg_block[SegMid].w / 2;
   s_seg_digit[SegBig] = big ? seg_text_size("8", big).w : s_seg_block[SegBig].w / 2;
-  s_seg_self_test = big ? seg_text_size("88:88", big) : GSize(110, 64);
+  s_seg_self_test = big ? seg_text_size("88", big) : GSize(104, 64);
 }
 
 static GSize seg_block_size(SegSize size) {
@@ -1127,6 +1159,9 @@ static GColor state_color(const char *state) {
   if (state_is(state, "run")) {
     return active_color();
   }
+  if (state_is(state, "monitor")) {
+    return monitoring_color();
+  }
   if (state_is(state, "settled") || state_is(state, "snooze") || state_is(state, "empty")) {
     return lcd_dim();
   }
@@ -1136,6 +1171,7 @@ static GColor state_color(const char *state) {
 static const char *state_word(const char *state) {
   if (state_is(state, "needs")) return "NEEDS YOU";
   if (state_is(state, "run")) return "RUNNING";
+  if (state_is(state, "monitor")) return "MONITORING";
   if (state_is(state, "err")) return "ERROR";
   if (state_is(state, "idle")) return "IDLE";
   if (state_is(state, "settled")) return "ALL SETTLED";
@@ -1229,23 +1265,21 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
     GSize full = s_seg_self_test;
     int x = panel.origin.x + (panel.size.w - full.w) / 2;
     graphics_context_set_text_color(ctx, lcd_ghost_tone());
-    graphics_draw_text(ctx, "88:88", font, GRect(x, y, full.w + 4, full.h + 4),
+    graphics_draw_text(ctx, "88", font, GRect(x, y, full.w + 4, full.h + 4),
                        GTextOverflowModeFill, GTextAlignmentLeft, NULL);
     hatch_rect(ctx, GRect(x, y, full.w + 2, full.h + 2));
 
-    /* One digit lights at a time, walking the field like a power-on test --
-       but only while the phone is actually being waited on, which is the only
-       time this screen has a timer behind it. Settled states (no hosts, no
-       link) get the ghosted field alone rather than a walk frozen wherever the
-       last tick happened to leave it. */
-    if (busy_any()) {
-      static const char *steps[5] = { "8", " 8", "   8", "    8", "" };
-      int lit = (s_stream_phase / 6) % 6;
-      if (lit < 5 && steps[lit][0]) {
-        graphics_context_set_text_color(ctx, lcd_ink());
-        graphics_draw_text(ctx, steps[lit], font, GRect(x, y, full.w + 4, full.h + 4),
-                           GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-      }
+    /* A stationary elapsed timer makes a slow host legible without sending a
+       digit walking out of the LCD field. It rides the existing busy timer;
+       stream_timer_callback limits full-panel redraws to one per second. */
+    if (!s_hosts_synced) {
+      int elapsed = connecting_elapsed_seconds();
+      char counter[3];
+      snprintf(counter, sizeof(counter), "%02d", elapsed);
+      s_connect_draw_second = elapsed;
+      graphics_context_set_text_color(ctx, lcd_ink());
+      graphics_draw_text(ctx, counter, font, GRect(x, y, full.w + 4, full.h + 4),
+                         GTextOverflowModeFill, GTextAlignmentLeft, NULL);
     }
     y += full.h + 4;
   } else {
@@ -1274,31 +1308,25 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
 }
 
 /* One channel of the home screen, drawn as a Casio sub-display: a boxed field
-   holding a segment readout, the state it counts, and a bar for that state's
-   share of the machine. Three stacked is the whole screen.
+   holding a segment readout, the state it counts, and a 14-square roster.
+   Three stacked is the whole screen.
 
    They are deliberately the same size. Which state matters is a property of
-   the machine right now, not of the layout, so the band that can be acted on
-   earns attention by inverting -- the way a lit mode marker does on the
-   reference -- rather than by being drawn bigger than its neighbours. */
+   the machine right now, not of the layout. Needs-you uses the Casio alert red
+   on the same LCD field as its neighbours, without a black inversion. */
 static void draw_state_band(GContext *ctx, GRect band, const char *state, const char *label,
-                            int count, int total) {
-  bool alert = count > 0 && state_is(state, "needs");
-  GColor ink = alert ? lcd_glass() : (count > 0 ? state_color(state) : lcd_dim());
-  GColor unlit = alert ? lcd_dim() : lcd_ghost_tone();
+                            int count, int total, int first_count, int second_count,
+                            const char *second_state) {
+  GColor ink = count > 0 ? state_color(state) : lcd_dim();
+  GColor unlit = lcd_ghost_tone();
 
-  if (alert) {
-    graphics_context_set_fill_color(ctx, lcd_ink());
-    graphics_fill_rect(ctx, band, 3, GCornersAll);
-  } else {
-    draw_field_box(ctx, band);
-  }
+  draw_field_box(ctx, band);
 
   GSize block = seg_block_size(SegMid);
   int pad = 5;
   int seg_x = band.origin.x + pad;
   draw_seg_value_ex(ctx, GPoint(seg_x, band.origin.y + (band.size.h - block.h) / 2),
-                    clamp_int(count, 0, 99), ink, SegMid, unlit, !alert);
+                    clamp_int(count, 0, 99), ink, SegMid, unlit, true);
 
   int text_x = seg_x + block.w + 8;
   int text_w = band.origin.x + band.size.w - pad - text_x;
@@ -1313,18 +1341,24 @@ static void draw_state_band(GContext *ctx, GRect band, const char *state, const 
   draw_tracked_max(ctx, label, font_legend(), GPoint(text_x, band.origin.y + 7),
                    text_w - share_w - 6);
 
-  /* Unlit cells are drawn in the ghost tone rather than left blank: a real
-     panel shows the whole scale and lights part of it. All three bars share
-     the machine total, so read together they are how loaded it is. */
-  int cell = 5, step = 7;
-  int cells = text_w / step;
-  int lit = total > 0 ? (count * cells) / total : 0;
-  if (lit < 1 && count > 0) {
-    lit = 1;
-  }
-  for (int i = 0; i < cells; i++) {
-    graphics_context_set_fill_color(ctx, i < lit ? ink : unlit);
-    graphics_fill_rect(ctx, GRect(text_x + i * step, band.origin.y + 24, cell, 7), 0, GCornerNone);
+  /* This is a capped roster, not a percentage bar: one square is one thread
+     through 14, and 14+ fills the strip. The fraction above remains exact.
+     Fixed 5px cells keep these looking like the chunky squares from the
+     original dashboard. The second colour lets running and monitoring coexist. */
+  const int slots = 14;
+  const int cell = 5;
+  const int gap = 2;
+  const int meter_w = slots * cell + (slots - 1) * gap;
+  int meter_x = text_x + (text_w - meter_w) / 2;
+  int meter_y = band.origin.y + 25;
+  GColor second_ink = second_count > 0 ? state_color(second_state) : ink;
+  for (int i = 0; i < slots; i++) {
+    GColor square = i < first_count ? ink :
+                    (i < first_count + second_count ? second_ink : unlit);
+    graphics_context_set_fill_color(ctx, square);
+    graphics_fill_rect(ctx,
+                       GRect(meter_x + i * (cell + gap), meter_y, cell, cell),
+                       0, GCornerNone);
   }
 }
 
@@ -1343,7 +1377,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   } else {
     snprintf(right, sizeof(right), "--");
   }
-  draw_legend_band(ctx, bounds, "T3 CODE", right);
+  draw_legend_band(ctx, bounds, "P3", right);
 
   /* Always the static rail: s_host_rail_layer sits on top of it and carries the
      sweep while a refresh is in flight, so the panel never has to repaint for
@@ -1369,7 +1403,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   HostItem *host = &s_hosts[clamp_int(s_host_cursor, 0, s_host_count - 1)];
   int inner_x = panel.origin.x + 7;
   int inner_w = panel.size.w - 14;
-  int total = host->needs + host->run + host->idle + host->settled;
+  int total = host->needs + host->run + host->monitor + host->idle + host->settled;
   int strip_y = panel.origin.y + panel.size.h - 15;
 
   /* A host that did not answer has no counts worth reading: the trio would be
@@ -1410,8 +1444,8 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   }
 
   /* The machine, with what it holds underneath. Settled sits here rather than
-     in the bands below: it is history, and the bands are for the three states
-     you would actually do something about. */
+     in the bands below: it is history. Monitoring shares the running band so
+     quiet background work remains work while keeping its own green squares. */
   graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, host->title, font_row_title(),
                      GRect(inner_x, panel.origin.y + 2, inner_w, 20),
@@ -1432,12 +1466,16 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   int bands_bottom = strip_y - 7;
   int band_gap = 3;
   int band_h = (bands_bottom - bands_top - 2 * band_gap) / 3;
+  int running_count = host->run + host->monitor;
   const char *band_state[3] = { "needs", "run", "idle" };
   const char *band_label[3] = { "NEEDS YOU", "RUNNING", "IDLE" };
-  int band_count[3] = { host->needs, host->run, host->idle };
+  int band_count[3] = { host->needs, running_count, host->idle };
   for (int i = 0; i < 3; i++) {
+    int primary_count = i == 1 ? host->run : band_count[i];
+    int secondary_count = i == 1 ? host->monitor : 0;
     draw_state_band(ctx, GRect(inner_x, bands_top + i * (band_h + band_gap), inner_w, band_h),
-                    band_state[i], band_label[i], band_count[i], total);
+                    band_state[i], band_label[i], band_count[i], total,
+                    primary_count, secondary_count, "monitor");
   }
 
   /* The indicator row: hairline, meter with its caption, sync age, and the
@@ -1719,18 +1757,20 @@ static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
   }
   draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME, false);
 
-  int needs = 0, running = 0, settled = 0;
+  int needs = 0, running = 0, monitoring = 0, settled = 0;
   for (int i = 0; i < s_session_count; i++) {
     if (state_is(s_sessions[i].state, "needs")) needs++;
     else if (state_is(s_sessions[i].state, "run")) running++;
+    else if (state_is(s_sessions[i].state, "monitor")) monitoring++;
     else if (state_is(s_sessions[i].state, "settled") || state_is(s_sessions[i].state, "snooze")) settled++;
   }
   char tally[24];
   /* Bounded by MAX_SESSIONS in practice, but the band is 24 characters and a
      count that somehow ran away would truncate the row rather than overflow
      into the next field. */
-  snprintf(tally, sizeof(tally), "N%d R%d S%d", clamp_int(needs, 0, 999),
-           clamp_int(running, 0, 999), clamp_int(settled, 0, 999));
+  snprintf(tally, sizeof(tally), "N%d R%d M%d S%d", clamp_int(needs, 0, 999),
+           clamp_int(running, 0, 999), clamp_int(monitoring, 0, 999),
+           clamp_int(settled, 0, 999));
   draw_bottom_band(ctx, bounds, tally, "");
   if (!s_error_active) {
     draw_host_strip(ctx, GPoint(bounds.size.w - 8 - s_host_count * 8, bounds.size.h - BOTTOM_CHROME + 5),
@@ -1883,7 +1923,13 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
 /* Holding the new-project row describes a location instead of naming one: the
    concierge agent works out the path and it comes back to the same confirm. */
 static void thread_select_long(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
-  if (cell_index->section != 1 || cell_index->row != s_project_count) {
+  if (cell_index->section != 1 || !s_threads_synced || busy_is(BusyThreads) ||
+      cell_index->row > s_project_count) {
+    return;
+  }
+  if (cell_index->row < s_project_count) {
+    s_selected_project_index = cell_index->row;
+    open_project_actions();
     return;
   }
   s_dictation_target = DictationTargetConcierge;
@@ -1976,6 +2022,10 @@ static void request_refresh(void) {
   if (!iter) {
     return;
   }
+  if (!s_hosts_synced) {
+    s_host_connect_started_at = time(NULL);
+    s_connect_draw_second = -1;
+  }
   busy_set(BusyHosts);
   mark_all_dirty();
   update_stream_timer();
@@ -2047,6 +2097,20 @@ static void send_project_create(void) {
   app_message_outbox_send();
   s_pending_project_path[0] = '\0';
   s_pending_project_name[0] = '\0';
+}
+
+static void send_project_delete(void) {
+  if (s_selected_project_index < 0 || s_selected_project_index >= s_project_count) {
+    return;
+  }
+  DictionaryIterator *iter = NULL;
+  send_command_begin(&iter, CMD_PROJECT_DELETE);
+  if (!iter) {
+    return;
+  }
+  dict_write_cstring(iter, KEY_PROJECT_ID, s_projects[s_selected_project_index].id);
+  s_message_out++;
+  app_message_outbox_send();
 }
 
 /* A dictated name is only a proposal: the phone turns it into an absolute path
@@ -2136,9 +2200,21 @@ static void perform_action(ActionMenu *menu, const ActionMenuItem *action, void 
       set_status("Interrupting");
       send_thread_action("interrupt");
       return;
+    case ActionCancelProject:
+      s_pending_project_path[0] = '\0';
+      s_pending_project_name[0] = '\0';
+      set_status("Project cancelled");
+      return;
     case ActionCreateProject:
       set_status("Creating project");
       send_project_create();
+      return;
+    case ActionCancelDelete:
+      set_status("Delete cancelled");
+      return;
+    case ActionDeleteProject:
+      set_status("Deleting project");
+      send_project_delete();
       return;
     case ActionModelBase:
       /* Model actions are the ActionModelBase+i range handled above. Keeping
@@ -2182,12 +2258,32 @@ static void open_thread_actions(void) {
 /* The confirm gate for a dictated project: the phone has resolved a path, and
    nothing is created until this menu is answered. */
 static void open_project_confirm(void) {
-  ActionMenuLevel *level = action_menu_level_create(1);
+  ActionMenuLevel *level = action_menu_level_create(2);
   if (!level) {
     log_error("Out of memory");
     return;
   }
+  /* Dictation can be wildly wrong. Cancellation is deliberately focused by
+     default, so accepting a bad folder takes an explicit Down then Select. */
+  action_menu_level_add_action(level, "Cancel", perform_action, (void *)(uintptr_t)ActionCancelProject);
   action_menu_level_add_action(level, "Create", perform_action, (void *)(uintptr_t)ActionCreateProject);
+  open_action_menu(level);
+}
+
+/* Holding a real project opens its destructive action behind a cancel-first
+   menu. Deleting therefore takes a deliberate Down then Select, while a short
+   Select keeps its existing new-thread flow. */
+static void open_project_actions(void) {
+  if (s_selected_project_index < 0 || s_selected_project_index >= s_project_count) {
+    return;
+  }
+  ActionMenuLevel *level = action_menu_level_create(2);
+  if (!level) {
+    log_error("Out of memory");
+    return;
+  }
+  action_menu_level_add_action(level, "Cancel", perform_action, (void *)(uintptr_t)ActionCancelDelete);
+  action_menu_level_add_action(level, "Delete project", perform_action, (void *)(uintptr_t)ActionDeleteProject);
   open_action_menu(level);
 }
 
@@ -2729,6 +2825,12 @@ static void show_screenshot_page(int page) {
     return;
   }
 
+  /* The offline capture parks the cursor on REMOTE. All later list/menu pages
+     use WORKBENCH's fixture data, so restore that host before deriving the
+     thread-screen title. */
+  if (page >= 6 && s_host_count > 0) {
+    s_host_cursor = 0;
+  }
   if (s_host_count > 0) {
     s_selected_host_index = clamp_int(s_host_cursor, 0, s_host_count - 1);
   }
@@ -2744,8 +2846,38 @@ static void show_screenshot_page(int page) {
     window_stack_push(s_thread_window, false);
   }
 
-  if (page == 1) {
+  if (page == 1 || page == 6) {
     mark_all_dirty();
+    return;
+  }
+
+  /* Scroll the second section into view so projects and their New project row
+     can be documented independently of the thread rows above them. */
+  if (page == 7) {
+    if (s_thread_menu && s_project_count > 0) {
+      menu_layer_set_selected_index(s_thread_menu, MenuIndex(1, 0), MenuRowAlignCenter, false);
+    }
+    mark_all_dirty();
+    return;
+  }
+
+  if (page == 8) {
+    snprintf(s_pending_project_name, sizeof(s_pending_project_name), "%s", "sparkle renderer");
+    snprintf(s_pending_project_path, sizeof(s_pending_project_path), "%s",
+             "/home/will/Projects/sparkle-renderer");
+    open_project_confirm();
+    return;
+  }
+
+  if (page == 9) {
+    s_selected_project_index = 0;
+    open_project_actions();
+    return;
+  }
+
+  if (page == 10) {
+    s_selected_index = 0;
+    open_thread_actions();
     return;
   }
 
@@ -2785,6 +2917,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       copy_tuple(host->state, sizeof(host->state), iter, KEY_STATE);
       host->needs = int_tuple(iter, KEY_C_NEEDS, 0);
       host->run = int_tuple(iter, KEY_C_RUN, 0);
+      host->monitor = int_tuple(iter, KEY_C_MONITOR, 0);
       host->idle = int_tuple(iter, KEY_C_IDLE, 0);
       host->settled = int_tuple(iter, KEY_C_SETTLED, 0);
       if (index + 1 > s_host_count) {
@@ -3148,6 +3281,7 @@ static void minute_tick(struct tm *tick_time, TimeUnits units_changed) {
 
 static void init(void) {
   s_launched_at = time(NULL);
+  s_host_connect_started_at = s_launched_at;
   s_font_dot = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_20));
   s_font_dot_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_10));
   s_font_dseg_big = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_64));

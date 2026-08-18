@@ -6,12 +6,12 @@ set -euo pipefail
 # required: this drives the published `t3` CLI.
 
 # Works from a clone and straight from a pipe:
-#   curl -fsSL https://raw.githubusercontent.com/twodotwill/t3pebble/main/run-t3code-tailscale.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/breakthebeta/p3code/main/run-p3-tailscale.sh | bash
 # Piped, there is no checkout to read the shared helpers from, so they are
-# fetched from the same ref. Pin one with T3PEBBLE_REF to avoid tracking main.
-T3PEBBLE_REPO="${T3PEBBLE_REPO:-twodotwill/t3pebble}"
-T3PEBBLE_REF="${T3PEBBLE_REF:-main}"
-T3PEBBLE_RAW_BASE="${T3PEBBLE_RAW_BASE:-https://raw.githubusercontent.com/$T3PEBBLE_REPO/$T3PEBBLE_REF}"
+# fetched from the same ref. Pin one with P3_REF to avoid tracking main.
+P3_REPO="${P3_REPO:-${T3PEBBLE_REPO:-breakthebeta/p3code}}"
+P3_REF="${P3_REF:-${T3PEBBLE_REF:-main}}"
+P3_RAW_BASE="${P3_RAW_BASE:-${T3PEBBLE_RAW_BASE:-https://raw.githubusercontent.com/$P3_REPO/$P3_REF}}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd)" || ROOT_DIR="."
 
@@ -23,20 +23,20 @@ else
     echo "curl is required when running this script outside a checkout." >&2
     exit 1
   fi
-  T3_RUNNER_SRC="$(curl -fsSL "$T3PEBBLE_RAW_BASE/lib/t3-runner.sh")" || {
-    echo "Could not fetch lib/t3-runner.sh from $T3PEBBLE_RAW_BASE" >&2
+  T3_RUNNER_SRC="$(curl -fsSL "$P3_RAW_BASE/lib/t3-runner.sh")" || {
+    echo "Could not fetch lib/t3-runner.sh from $P3_RAW_BASE" >&2
     exit 1
   }
   source /dev/stdin <<<"$T3_RUNNER_SRC"
 fi
 
 PORT="${PORT:-3773}"
-TOKEN_TTL="${T3PEBBLE_TOKEN_TTL:-365d}"
-TOKEN_LABEL="${T3PEBBLE_TOKEN_LABEL:-T3 Pebble watch}"
+TOKEN_TTL="${P3_TOKEN_TTL:-${T3PEBBLE_TOKEN_TTL:-365d}}"
+TOKEN_LABEL="${P3_TOKEN_LABEL:-${T3PEBBLE_TOKEN_LABEL:-P3 watch}}"
 # Opt-in only. Unset, this script behaves exactly as it always has: bind the
 # tailnet IP and hand the watch a plain-HTTP base URL.
-TAILSCALE_SERVE="${T3PEBBLE_TAILSCALE_SERVE:-0}"
-SERVE_PORT="${T3PEBBLE_SERVE_PORT:-443}"
+TAILSCALE_SERVE="${P3_TAILSCALE_SERVE:-${T3PEBBLE_TAILSCALE_SERVE:-0}}"
+SERVE_PORT="${P3_SERVE_PORT:-${T3PEBBLE_SERVE_PORT:-443}}"
 
 t3_resolve || exit 1
 
@@ -74,8 +74,8 @@ fi
 
 # Reuse a token across restarts when one is supplied; otherwise mint a fresh
 # bearer access token against the same data directory the server will use.
-if [[ -n "${T3PEBBLE_TOKEN:-}" ]]; then
-  TOKEN="$T3PEBBLE_TOKEN"
+if [[ -n "${P3_TOKEN:-${T3PEBBLE_TOKEN:-}}" ]]; then
+  TOKEN="${P3_TOKEN:-${T3PEBBLE_TOKEN:-}}"
 else
   AUTH_ARGS=(auth session issue)
   if [[ -n "${T3CODE_BASE_DIR:-}" ]]; then
@@ -95,15 +95,15 @@ if [[ "$TAILSCALE_SERVE" == "1" ]]; then
   t3_tailscale_serve_enable "$SERVE_PORT" "$HOST" "$PORT" || exit 1
 fi
 
-WATCH_LABEL="${T3PEBBLE_LABEL:-$(t3_default_label)}"
+WATCH_LABEL="${P3_LABEL:-${T3PEBBLE_LABEL:-$(t3_default_label)}}"
 
 cat <<EOF
-T3 Pebble server
+P3 server
 T3 URL:       $BASE_URL
 
 Paste this line into the Pebble app settings, under Quick setup:
 
-$(t3_bundle_line "$WATCH_LABEL" "$BASE_URL" "$TOKEN" "${T3PEBBLE_PROJECT_ROOT:-}")
+$(p3_bundle_line "$WATCH_LABEL" "$BASE_URL" "$TOKEN" "${P3_PROJECT_ROOT:-${T3PEBBLE_PROJECT_ROOT:-}}")
 
 Run this on each machine and paste every line to attach several hosts.
 
@@ -119,7 +119,7 @@ if [[ "${#WATCH_LABEL}" -gt 18 ]]; then
   cat <<EOF
 
 Note: "$WATCH_LABEL" is longer than the 18 characters the watch shows.
-Set a shorter one with: T3PEBBLE_LABEL=mac $0
+Set a shorter one with: P3_LABEL=mac $0
 EOF
 fi
 
