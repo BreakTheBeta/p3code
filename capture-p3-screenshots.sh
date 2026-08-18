@@ -119,8 +119,11 @@ capture() {
     # pebble screenshot --emulator launches a second QEMU under pebble-tool 5,
     # which produces a perfectly valid screenshot of the wrong watch. The QEMU
     # monitor dumps the framebuffer of the session that owns the fixture app.
+    # The emulator's screendump encodes Pebble's four channel levels as
+    # 0/33/66/100 instead of full-range 0/85/170/255. Expand that range here;
+    # otherwise GitHub renders the screenshots at less than half brightness.
     if printf 'screendump %s\n' "$ppm" | nc -q 1 127.0.0.1 "$QEMU_MONITOR_PORT" >/dev/null &&
-      [ -s "$ppm" ] && convert "$ppm" "$OUT_DIR/$name.png"; then
+      [ -s "$ppm" ] && convert "$ppm" -level 0%,38.823529% "$OUT_DIR/$name.png"; then
       rm -f "$ppm"
       return
     fi
