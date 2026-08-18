@@ -1150,6 +1150,45 @@ static void sync_age_text(char *out, size_t size) {
   }
 }
 
+/* The host screen doubles as the surface left open all day. Its clock rides
+   the MINUTE_UNIT tick already used by sync age, so it adds neither a timer nor
+   an idle animation. Reserve the same live fields as draw_legend_band before
+   centring it, so a host counter or fault count can never run through it. */
+static void draw_host_clock(GContext *ctx, GRect bounds, const char *right) {
+  time_t now = time(NULL);
+  struct tm *local = localtime(&now);
+  if (!local) {
+    return;
+  }
+
+  char text[8];
+  strftime(text, sizeof(text), clock_is_24h_style() ? "%H:%M" : "%I:%M", local);
+  if (!clock_is_24h_style() && text[0] == '0') {
+    memmove(text, text + 1, strlen(text));
+  }
+
+  int left_edge = GLASS_PAD + tracked_width("P3", font_legend()) + 6;
+  int right_edge = bounds.size.w - GLASS_PAD;
+  if (s_error_total > 0) {
+    char fault[24];
+    snprintf(fault, sizeof(fault), "ERR%d", s_error_total);
+    right_edge -= tracked_width(fault, font_legend()) + 6;
+  }
+  if (right && right[0]) {
+    right_edge -= tracked_width(right, font_legend()) + 6;
+  }
+
+  int width = tracked_width(text, font_legend());
+  if (right_edge - left_edge < width) {
+    return;
+  }
+  int x = (bounds.size.w - width) / 2;
+  x = clamp_int(x, left_edge, right_edge - width);
+  int y = ink_origin_y(GRect(0, 0, 0, LEGEND_HEIGHT), font_legend());
+  graphics_context_set_text_color(ctx, legend());
+  draw_tracked(ctx, text, font_legend(), GPoint(x, y));
+}
+
 /* ------------------------------------------------------------ state marks */
 
 static GColor state_color(const char *state) {
@@ -1378,6 +1417,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
     snprintf(right, sizeof(right), "--");
   }
   draw_legend_band(ctx, bounds, "P3", right);
+  draw_host_clock(ctx, bounds, right);
 
   /* Always the static rail: s_host_rail_layer sits on top of it and carries the
      sweep while a refresh is in flight, so the panel never has to repaint for
@@ -1640,24 +1680,41 @@ static void diag_layer_update_proc(Layer *layer, GContext *ctx) {
        the first line of the next, which is how a readable log turns into a
        smear. Three lines is the cap; past that the message is padding. */
     GFont entry_font = fonts_get_system_font(FONT_KEY_GOTHIC_14);
-    int text_w = w - 16;
+    char oldest_idx[12];
+    snprintf(oldest_idx, sizeof(oldest_idx), "%d",
+             s_error_total - s_error_log_count + 1);
+    char newest_idx[12];
+    snprintf(newest_idx, sizeof(newest_idx), "%d", s_error_total);
+    int index_w = tracked_width(oldest_idx, font_legend());
+    int newest_w = tracked_width(newest_idx, font_legend());
+    if (newest_w > index_w) {
+      index_w = newest_w;
+    }
+    int gutter = index_w + 6;
+    int text_w = w - gutter;
     for (int i = 0; i < s_error_log_count && y < log_bottom; i++) {
       GSize size = graphics_text_layout_get_content_size(
           s_error_log[i], entry_font, GRect(0, 0, text_w, 48),
           GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft);
       int h = size.h > 0 ? size.h : 16;
-      if (y + h > log_bottom) {
-        h = log_bottom - y;
+      int available = log_bottom - y;
+      if (h + 2 > available) {
+        h = available - 2;
       }
-      char idx[6];
+      if (h <= 0) {
+        break;
+      }
+      char idx[12];
       snprintf(idx, sizeof(idx), "%d", s_error_total - i);
       graphics_context_set_text_color(ctx, alert_color());
-      draw_tracked(ctx, idx, font_legend(), GPoint(x, y - 2));
+      draw_tracked(ctx, idx, font_legend(), GPoint(x, y + 1));
       graphics_context_set_text_color(ctx, lcd_ink());
       graphics_draw_text(ctx, s_error_log[i], entry_font,
-                         GRect(x + 16, y - 3, text_w, h + 4),
+                         GRect(x + gutter, y, text_w, h + 2),
                          GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-      y += h + 3;
+      /* The next entry begins below this draw rectangle, not inside its extra
+         layout padding. This matters when two wrapped faults are adjacent. */
+      y += h + 4;
     }
   }
 
@@ -1719,10 +1776,17 @@ static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
                      GRect(25, 0, bounds.size.w - 31, 21),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
+  /* Pebble fonts can paint outside their nominal layout rectangle, so merely
+     making the two rectangles disjoint does not guarantee separate ink. Give
+     the detail its own lower band, then clear a five-row guard between the
+     lines after both draws. That makes overlap impossible even with fallback
+     font metrics, without changing the fixed 48px row geometry. */
   graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, detail, font_row_detail(),
-                     GRect(25, 19, bounds.size.w - 31, 17),
+                     GRect(25, 27, bounds.size.w - 31, 15),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  graphics_context_set_fill_color(ctx, lcd_glass());
+  graphics_fill_rect(ctx, GRect(25, 22, bounds.size.w - 31, 5), 0, GCornerNone);
 
   graphics_context_set_fill_color(ctx, lcd_dim());
   graphics_fill_rect(ctx, GRect(6, bounds.size.h - 1, bounds.size.w - 12, 1), 0, GCornerNone);
