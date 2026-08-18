@@ -241,19 +241,3 @@ storyboard, and updates the eleven committed PNGs in `docs/screenshots/`. It
 grabs the running QEMU framebuffer directly, so Pebble Tool 5.x cannot quietly
 attach a fresh emulator with no app installed. The script needs native `pebble`,
 Python 3, netcat, and ImageMagick.
-
-## Why this exists
-
-The Pebble is too constrained to run a full T3 Code client. The PebbleKit JS
-bridge on the phone gives the watch a compact control surface, while the laptop
-remains where the real work happens. Tailscale provides the private network path
-between phone and laptop.
-
-Nothing in the T3 Code runtime has to change. All the Pebble-specific logic stays
-in this app.
-
-## Contributing and security
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and
-[SECURITY.md](SECURITY.md) for reporting vulnerabilities privately.
-Release-facing changes are recorded in [CHANGELOG.md](CHANGELOG.md).
