@@ -336,6 +336,42 @@ async function main() {
   // The server requires this reason, and it is what makes the reopen explicit.
   assert.strictEqual(state.dispatches.find((d) => d.type === "thread.unsettle").reason, "user")
 
+  // --- pinning ------------------------------------------------------------
+  bridge.listeners.appmessage({
+    payload: { [KEY.cmd]: CMD.threadAction, [KEY.sessionId]: "s1::ses_monitoring", [KEY.action]: "pin" },
+  })
+  await waitFor(() => state.dispatches.some((d) => d.type === "thread.pin"), "pin dispatch")
+  const pinCommand = state.dispatches.find((d) => d.type === "thread.pin")
+  assert.strictEqual(pinCommand.threadId, "ses_monitoring")
+  // A two-button list cannot express a position, so the watch never sends one
+  // and the server appends the pin to the end of the block.
+  assert.strictEqual(pinCommand.orderKey, undefined)
+
+  bridge.sentMessages.length = 0
+  bridge.listeners.appmessage({
+    payload: { [KEY.cmd]: CMD.threadAction, [KEY.sessionId]: "s1::ses_running", [KEY.action]: "unpin" },
+  })
+  await waitFor(() => state.dispatches.some((d) => d.type === "thread.unpin"), "unpin dispatch")
+  assert.strictEqual(state.dispatches.find((d) => d.type === "thread.unpin").threadId, "ses_running")
+  // The ack lands after the cached shell is dropped, so waiting for it is what
+  // makes the re-listing below read the server rather than the stale snapshot.
+  await waitFor(() => bridge.sentMessages.some((m) => m.cmd === CMD.prompt), "unpin ack")
+
+  // The pin the server now holds leads the next listing, flagged so the watch
+  // knows where its PINNED section ends.
+  state.shell.threads.find((t) => t.id === "ses_monitoring").pinnedAt = iso(1000)
+  bridge.sentMessages.length = 0
+  bridge.listeners.appmessage({ payload: { [KEY.cmd]: CMD.selectHost, [KEY.hostId]: "s1" } })
+  await waitFor(() => bridge.sentMessages.find((m) => m.cmd === CMD.projectEnd), "pinned listing")
+  const pinnedRows = bridge.sentMessages.filter((m) => m.cmd === CMD.sessionItem)
+  assert.strictEqual(pinnedRows[0].session_id, "s1::ses_monitoring")
+  assert.strictEqual(pinnedRows[0].pinned, 1)
+  assert.strictEqual(pinnedRows[0].index, 0)
+  // Everything below the block is unflagged, which is what makes the watch's
+  // leading-run count the same split the phone made.
+  assert.ok(pinnedRows.slice(1).every((row) => row.pinned === 0))
+  state.shell.threads.find((t) => t.id === "ses_monitoring").pinnedAt = null
+
   // restore the active-scope listing and the dispatch counter the later
   // assertions build on
   state.dispatches.length = 0

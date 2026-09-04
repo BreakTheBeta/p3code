@@ -22,7 +22,7 @@ metadata come over stock T3's authenticated WebSocket RPC.
 
 | Host overview | Active threads | Thread detail |
 | --- | --- | --- |
-| ![Host overview screen, with WORKBENCH split into needs-you, running, and idle thread bands](docs/screenshots/00-host-dashboard.png?v=2) | ![Active thread list with needs-you, running, idle, and errored rows](docs/screenshots/01-active-thread-list.png?v=2) | ![Thread detail screen showing status, provider, and the latest summary](docs/screenshots/02-thread-detail.png?v=2) |
+| ![Host overview screen, with WORKBENCH split into needs-you, running, and idle thread bands](docs/screenshots/00-host-dashboard.png?v=3) | ![Active thread list, a pinned row above the needs-you, running, idle, and errored ones](docs/screenshots/01-active-thread-list.png?v=3) | ![Thread detail screen showing status, provider, and the latest summary](docs/screenshots/02-thread-detail.png?v=3) |
 
 ## Quick start
 
@@ -86,22 +86,22 @@ without holding up the others.
 | Select | Open that machine's threads |
 | Long-press Select | Diagnostics — failures are logged on the watch instead of flashing an error at you |
 
-![Host overview screen, WORKBENCH with its grid of blocks and exact thread counts](docs/screenshots/00-host-dashboard.png?v=2)
+![Host overview screen, WORKBENCH with its grid of blocks and exact thread counts](docs/screenshots/00-host-dashboard.png?v=3)
 
-**Thread list** — active threads first: running, waiting, errored.
+**Thread list** — pinned threads first, then the rest: running, waiting, errored.
 
 | | |
 | --- | --- |
 | Up / Down | Move between threads |
 | Select | Open the thread |
-| Long-press Select on a thread | Thread actions — Reply, Settle, and Interrupt for active threads; Unsettle for settled ones |
+| Long-press Select on a thread | Thread actions — Reply, Settle, and Interrupt for active threads; Unsettle for settled ones; Pin or Unpin for any |
 | Select on a project | Pick a model, then dictate the first prompt of a new thread |
 | Long-press Select on a project | Open the cancel-first project delete menu |
 | Last row | Switch scope: `SETTLED 34` goes to the settled list, `ACTIVE 6` returns to the active list. A `MORE 20 OF 34` row fetches the next page. |
 
 | Active thread list | Thread actions | Settled thread list |
 | --- | --- | --- |
-| ![Active threads grouped above the projects section](docs/screenshots/01-active-thread-list.png?v=2) | ![Action menu for an active thread offering Reply, Settle, and Interrupt](docs/screenshots/10-thread-actions.png?v=2) | ![Settled threads, with a bottom row back to the active scope](docs/screenshots/06-settled-thread-list.png?v=2) |
+| ![A PINNED section above the THREADS section, with the pinned row carrying a pushpin](docs/screenshots/01-active-thread-list.png?v=3) | ![Action menu for a pinned thread offering Reply, Settle, Interrupt, and Unpin](docs/screenshots/10-thread-actions.png?v=3) | ![Settled threads, with a bottom row back to the active scope](docs/screenshots/06-settled-thread-list.png?v=3) |
 
 **Thread detail** — title, project path, provider, status, and the latest
 summary.
@@ -114,14 +114,17 @@ summary.
 
 | Summary | Transcript |
 | --- | --- |
-| ![Thread summary showing title, status, provider, and the latest reply](docs/screenshots/02-thread-detail.png?v=2) | ![Paged transcript showing the back-and-forth between user and agent](docs/screenshots/03-thread-transcript.png?v=2) |
+| ![Thread summary showing title, status, provider, and the latest reply](docs/screenshots/02-thread-detail.png?v=3) | ![Paged transcript showing the back-and-forth between user and agent](docs/screenshots/03-thread-transcript.png?v=3) |
 
 Dictating `stop`, `interrupt`, or `cancel turn` interrupts the turn in progress.
 Approval requests and user-input requests from T3 Code are answered the same way.
 
-Pinned threads lead the active list in T3's own order; ordinary active threads
-stay sorted newest-first by creation time and do not jump to the top just because
-an agent replied. Settled history is ordered by most recently finished. A thread
+Pinned threads lead the active list in T3's own order, under their own
+**PINNED** heading and each marked with a pushpin; the headings appear only when
+something is actually pinned. Pin and Unpin are in the thread action menu, and
+pinning is also the quickest way out of the settled list, because T3 reopens a
+thread it pins. Ordinary active threads stay sorted newest-first by creation
+time and do not jump to the top just because an agent replied. Settled history is ordered by most recently finished. A thread
 settles after a configured quiet window (three days by default), when its PR
 closes, or when it is merged if settle-on-merge is enabled. An open PR still
 counts as active, matching T3 Code's sidebar. T3's background **Monitoring**
@@ -140,7 +143,7 @@ battery, frame rate, and message counts.
 
 | Offline host | Diagnostics |
 | --- | --- |
-| ![The REMOTE host offline, showing that its T3 access token has expired](docs/screenshots/05-host-offline.png?v=2) | ![Diagnostics screen with sync, battery, frame rate, message, and failure information](docs/screenshots/04-diagnostics.png?v=2) |
+| ![The REMOTE host offline, showing that its T3 access token has expired](docs/screenshots/05-host-offline.png?v=3) | ![Diagnostics screen with sync, battery, frame rate, message, and failure information](docs/screenshots/04-diagnostics.png?v=3) |
 
 ## Creating a project from the watch
 
@@ -171,7 +174,7 @@ checkout on disk.
 
 | Project list | Create confirmation | Delete menu |
 | --- | --- | --- |
-| ![Projects section with p3code, watch-lab, and New project rows](docs/screenshots/07-project-list.png?v=2) | ![Cancel-first project create confirmation menu](docs/screenshots/08-project-create-confirmation.png?v=2) | ![Cancel-first project delete menu](docs/screenshots/09-project-delete-menu.png?v=2) |
+| ![Projects section with p3code, watch-lab, and New project rows](docs/screenshots/07-project-list.png?v=3) | ![Cancel-first project create confirmation menu](docs/screenshots/08-project-create-confirmation.png?v=3) | ![Cancel-first project delete menu](docs/screenshots/09-project-delete-menu.png?v=3) |
 
 ## Reference
 

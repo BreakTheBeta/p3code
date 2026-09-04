@@ -40,7 +40,8 @@
     { "name": "model", "id": 32, "c": "KEY_MODEL" },
     { "name": "instance_id", "id": 33, "c": "KEY_INSTANCE_ID" },
     { "name": "is_default", "id": 34, "c": "KEY_IS_DEFAULT" },
-    { "name": "c_monitor", "id": 35, "c": "KEY_C_MONITOR" }
+    { "name": "c_monitor", "id": 35, "c": "KEY_C_MONITOR" },
+    { "name": "pinned", "id": 36, "c": "KEY_PINNED" }
   ],
 
   "commands": [

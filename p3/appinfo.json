@@ -48,7 +48,8 @@
     "model": 32,
     "instance_id": 33,
     "is_default": 34,
-    "c_monitor": 35
+    "c_monitor": 35,
+    "pinned": 36
   },
   "resources": {
     "media": [

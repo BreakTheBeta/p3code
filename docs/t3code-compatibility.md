@@ -86,7 +86,13 @@ either background label.
 `settledOverride: "settled"` — the server's decider clears one on the other, so
 the two only ever coexist on a raced write. Pinned rows form the first block in
 the watch's active scope, ordered by `pinOrderKey`; keyless pins fall back to
-newest-created order, matching `sortPinnedThreadsByOrderKey`.
+newest-created order, matching `sortPinnedThreadsByOrderKey`. The watch draws
+that block as a **PINNED** section above a **THREADS** one, with a pushpin on
+each pinned row; both headers appear only when something is actually pinned, so
+an unpinned host keeps the single unlabelled run of rows. The row carries a
+`pinned` flag rather than a section boundary, and the watch counts the leading
+run of it — an out-of-order pin lands in the ordinary section with its marker
+still drawn instead of mislabelling the rows between.
 
 **Settled is derived, not stored.** The API carries only `settledOverride` and
 `settledAt`, and both are null on a thread that settled by inactivity or PR
@@ -121,12 +127,20 @@ classifies differently is a client missing one of the inputs.
 - `thread.turn.start`
 - `thread.turn.interrupt`
 - `thread.settle` / `thread.unsettle`
+- `thread.pin` / `thread.unpin`
 - `thread.approval.respond`
 - `thread.user-input.respond`
 
 `thread.unsettle` requires `reason: "user"`. Settling sets `settledAt` and
 `settledOverride: "settled"`; unsettling clears `settledAt` and sets
 `settledOverride: "active"`.
+
+`thread.pin` takes an optional `orderKey`. The watch never sends one: a
+two-button list has no way to express a position, so the server appends a
+keyless pin to the end of the pinned block. Pinning is also the one-press way
+out of the settled list, because T3's decider emits `thread.unsettled` and
+`thread.unsnoozed` alongside `thread.pinned` for a thread that was in either.
+Re-pinning an already-pinned thread keeps the original `pinnedAt`.
 
 `project.create` honours `createWorkspaceRootIfMissing`, and the REST
 normalizer resolves `workspaceRoot` before dispatch, so the watch can create a
