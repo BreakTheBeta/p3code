@@ -1,0 +1,35 @@
+{
+  "//": "The single source of truth for the watch/phone wire protocol and the build label. Edit this file, then run `node tools/gen-protocol.js`. `node test/protocol.test.js` fails if the generated blocks in appinfo.json, src/c/main.c and src/pkjs/index.js have drifted from it.",
+
+  "//buildLabel": "Two components only: the Pebble SDK rejects a versionLabel that is not Major or Major.Minor, and appinfo.json takes this with the leading v stripped.",
+  "buildLabel": "v0.1",
+
+  "keys": [
+    { "name": "cmd", "id": 0, "c": "KEY_CMD" },
+    { "name": "index", "id": 1, "c": "KEY_INDEX" },
+    { "name": "total", "id": 2, "c": "KEY_TOTAL" },
+    { "name": "author", "id": 3, "c": "KEY_AUTHOR" },
+    { "name": "age", "id": 4, "c": "KEY_AGE" },
+    { "name": "preview", "id": 5, "c": "KEY_PREVIEW" },
+    { "name": "body", "id": 6, "c": "KEY_BODY" },
+    { "name": "offset", "id": 7, "c": "KEY_OFFSET" },
+    { "name": "chunks", "id": 8, "c": "KEY_CHUNKS" },
+    { "name": "error", "id": 9, "c": "KEY_ERROR" },
+    { "name": "status", "id": 10, "c": "KEY_STATUS" },
+    { "name": "pool", "id": 11, "c": "KEY_POOL" },
+    { "name": "window", "id": 12, "c": "KEY_WINDOW" },
+    { "name": "karma", "id": 13, "c": "KEY_KARMA" }
+  ],
+
+  "//commands": "REFRESH re-fetches from LessWrong. SHUFFLE redraws a new sample from the pool the phone already has, which costs no HTTP request at all -- the reason the phone keeps the whole day rather than only what it sent.",
+  "commands": [
+    { "name": "REFRESH", "id": 1 },
+    { "name": "SHUFFLE", "id": 2 },
+    { "name": "TAKE_ITEM", "id": 3 },
+    { "name": "TAKE_END", "id": 4 },
+    { "name": "BODY_REQUEST", "id": 5 },
+    { "name": "BODY_CHUNK", "id": 6 },
+    { "name": "ERROR", "id": 7 },
+    { "name": "STATUS", "id": 8 }
+  ]
+}

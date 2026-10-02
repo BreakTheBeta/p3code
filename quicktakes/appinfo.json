@@ -1,0 +1,50 @@
+{
+  "uuid": "bf644c4b-d557-45f1-868c-e7ffda47f9af",
+  "shortName": "Quick Takes",
+  "longName": "LessWrong Quick Takes",
+  "companyName": "Break the Beta",
+  "versionLabel": "0.1",
+  "sdkVersion": "3",
+  "enableMultiJS": true,
+  "targetPlatforms": [
+    "emery"
+  ],
+  "watchapp": {
+    "watchface": false
+  },
+  "appKeys": {
+    "cmd": 0,
+    "index": 1,
+    "total": 2,
+    "author": 3,
+    "age": 4,
+    "preview": 5,
+    "body": 6,
+    "offset": 7,
+    "chunks": 8,
+    "error": 9,
+    "status": 10,
+    "pool": 11,
+    "window": 12,
+    "karma": 13
+  },
+  "resources": {
+    "media": [
+      {
+        "type": "png",
+        "name": "IMAGE_MENU_ICON",
+        "file": "images/menu_icon.png",
+        "menuIcon": true
+      },
+      {
+        "type": "font",
+        "name": "FONT_DOT_10",
+        "file": "fonts/Dot6x10-1x.ttf",
+        "characterRegex": "[ -~\u2026]"
+      }
+    ]
+  },
+  "capabilities": [
+    "configurable"
+  ]
+}

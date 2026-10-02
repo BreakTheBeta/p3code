@@ -119,6 +119,13 @@ var T3_SHELL_PATH = "/api/orchestration/shell";
 var T3_THREAD_PATH = "/api/orchestration/threads/";
 var T3_DISPATCH_PATH = "/api/orchestration/dispatch";
 var T3_WEBSOCKET_TICKET_PATH = "/api/auth/websocket-ticket";
+// T3 Code Fold (and current upstream) speak orchestration protocol 2; stock
+// 0.0.38 speaks 1. A protocol-1 server ignores both of these and a protocol-2
+// server rejects the request without them -- 400 on the REST read, a 1006 close
+// on the WebSocket upgrade -- so they are sent unconditionally rather than
+// gated on a probe. Verified against stock 0.0.38 and Fold 0.3.4.
+var T3_ORCHESTRATION_PROTOCOL_HEADER = "x-t3-orchestration-protocol";
+var T3_ORCHESTRATION_PROTOCOL = "2";
 // Turn windows requested when hydrating thread bodies. The list only needs
 // enough turns to recover a status badge and a summary line; the transcript
 // view asks for a much deeper window.
@@ -135,6 +142,9 @@ var MODEL_CONFIG_TIMEOUT_MS = 12000;
 // shell poll; a VCS timeout is optional metadata and must never make the host
 // itself read offline.
 var VCS_STATUS_TIMEOUT_MS = 8000;
+// A protocol-2 write is a ticket fetch plus a socket round trip, so it is
+// given more room than a REST POST had.
+var DISPATCH_TIMEOUT_MS = 12000;
 // New threads inherit whatever the project's default is on the server. This
 // is only used when a project carries no default at all.
 var FALLBACK_MODEL_SELECTION = { instanceId: "codex", model: "gpt-5.6-sol" };
@@ -654,7 +664,12 @@ function httpRequest(server, method, path, body, callback, timeoutMs) {
       return;
     }
     if (status < 200 || status >= 300) {
-      finish(new Error(httpFailureMessage(status, request.responseText, server)));
+      var httpError = new Error(httpFailureMessage(status, request.responseText, server));
+      // Carried so a caller can tell "this route is not on this server" (404)
+      // from "this server said no". Matching on the message text would break
+      // the first time the wording changed.
+      httpError.status = status;
+      finish(httpError);
       return;
     }
     var text = trim(request.responseText);
@@ -676,6 +691,7 @@ function httpRequest(server, method, path, body, callback, timeoutMs) {
     request.timeout = budgetMs;
     request.setRequestHeader("Authorization", "Bearer " + server.token);
     request.setRequestHeader("Accept", "application/json");
+    request.setRequestHeader(T3_ORCHESTRATION_PROTOCOL_HEADER, T3_ORCHESTRATION_PROTOCOL);
     if (body !== null && body !== undefined) {
       request.setRequestHeader("Content-Type", "application/json");
     }
@@ -725,7 +741,8 @@ function webSocketUrl(server, ticket) {
   return normalizeBaseUrl(server && server.baseUrl)
     .replace(/^http:/i, "ws:")
     .replace(/^https:/i, "wss:") +
-    "/ws?wsTicket=" + encodeURIComponent(ticket);
+    "/ws?wsTicket=" + encodeURIComponent(ticket) +
+    "&orchestrationProtocol=" + T3_ORCHESTRATION_PROTOCOL;
 }
 
 // Provider/model snapshots are not part of T3's orchestration REST read
@@ -1102,7 +1119,11 @@ function fetchThreadDetail(compositeThreadId, turnLimit, callback) {
       callback(error);
       return;
     }
-    var thread = response && response.thread;
+    // Protocol 2 answers with a projection and no `thread` key at all, which
+    // read as "Thread not found" -- every thread on the watch refused to open.
+    var thread = response && response.projection
+      ? normalizeV2Projection(server, response.projection)
+      : response && response.thread;
     if (!thread) {
       callback(new Error("Thread not found"));
       return;
@@ -1134,8 +1155,371 @@ function refreshThread(threadId, turnLimit, callback) {
 }
 
 
+// ---------------------------------------------------------------- protocol 2
+//
+// T3 Code Fold and current upstream serve orchestration protocol 2, which
+// reshaped the thread read model and moved writes off REST. Rather than teach
+// the whole bridge two vocabularies, a v2 snapshot is translated back into the
+// v1 shape at ingest, so every derivation below this line -- the state bands,
+// settlement, snooze, pinning -- keeps working unchanged against both.
+//
+// The snapshot says which protocol it is: v2 carries schemaVersion and splits
+// archivedThreads out, v1 carries neither. That is a fact about the payload in
+// hand, so it needs no capability probe and cannot go stale.
+
+// threadId -> { runId, requestId } per server, harvested while normalizing.
+// run.interrupt needs the run id that the v1 command never carried, and the
+// call sites only know the thread.
+var v2RuntimeByServer = {};
+var protocolByServer = {};
+
+function isV2Snapshot(snapshot) {
+  return !!snapshot && snapshot.schemaVersion >= 2;
+}
+
+/* Protocol 2 represents a provider's subagents as real child threads and puts
+   them in the shell list, which protocol 1 never did. They are the agent's own
+   working scratch -- titled by their working directory, so a Codex run fills the
+   watch with rows called "/root/<something>" that the user never started and
+   cannot usefully act on. T3's own sidebar hides them, using this exact test
+   (`relationshipToParent !== "subagent"`); a fork is a thread the user really
+   did branch, so it stays. */
+function isSubagentThread(thread) {
+  return !!thread && !!thread.lineage && thread.lineage.relationshipToParent === "subagent";
+}
+
+/** v1 session.status, from whichever v2 run is actually live. */
+function v2SessionStatus(thread) {
+  var activity = thread.activityRunStatus;
+  if (activity === "running" || activity === "waiting") {
+    return "running";
+  }
+  if (activity === "preparing" || activity === "queued" || activity === "starting") {
+    return "starting";
+  }
+  if (thread.status === "failed") {
+    return "error";
+  }
+  return "ready";
+}
+
+/** v1 latestTurn, from the v2 latestRun* stamps and the thread's run status. */
+function v2LatestTurn(thread) {
+  if (!thread.latestRunId && !thread.latestRunRequestedAt) {
+    return null;
+  }
+  var state = thread.status;
+  if (state === "failed") {
+    state = "error";
+  } else if (state === "idle") {
+    // "idle" describes the thread, not the run that last finished on it.
+    state = thread.latestRunCompletedAt ? "completed" : "running";
+  }
+  return {
+    state: state,
+    requestedAt: thread.latestRunRequestedAt || null,
+    startedAt: thread.latestRunStartedAt || null,
+    completedAt: thread.latestRunCompletedAt || null
+  };
+}
+
+function normalizeV2Thread(thread) {
+  var request = thread.pendingRuntimeRequest;
+  var kind = request && request.kind;
+  var tasks = thread.pendingBackgroundTasks;
+  var normalized = {};
+  for (var key in thread) {
+    if (thread.hasOwnProperty(key)) {
+      normalized[key] = thread[key];
+    }
+  }
+  normalized.session = {
+    status: v2SessionStatus(thread),
+    providerName: thread.providerInstanceId || null,
+    lastError: thread.lastError || null,
+    updatedAt: thread.updatedAt || null
+  };
+  normalized.latestTurn = v2LatestTurn(thread);
+  // The server classifies these two itself and warns that clients must agree:
+  // the agent asking its own question and a credential refresh both block, but
+  // neither is an approval.
+  normalized.hasPendingUserInput = kind === "user_input";
+  normalized.hasPendingApprovals = !!request && kind !== "user_input" && kind !== "auth_refresh";
+  normalized.backgroundLiveness = tasks && tasks.length ? "monitoring" : null;
+  return normalized;
+}
+
+/** A v2 snapshot as the rest of the bridge expects to read it. v1 passes
+    through untouched, which is what keeps stock T3 on its tested path. */
+function normalizeShellSnapshot(server, snapshot) {
+  if (!isV2Snapshot(snapshot)) {
+    if (server) {
+      protocolByServer[server.id] = 1;
+    }
+    return snapshot;
+  }
+  var runtime = {};
+  var threads = [];
+  var lists = [snapshot.threads || [], snapshot.archivedThreads || []];
+  for (var list = 0; list < lists.length; list++) {
+    for (var i = 0; i < lists[list].length; i++) {
+      var thread = lists[list][i];
+      if (isSubagentThread(thread)) {
+        continue;
+      }
+      runtime[thread.id] = {
+        runId: thread.activeRunId || thread.latestRunId || null,
+        requestId: (thread.pendingRuntimeRequest && thread.pendingRuntimeRequest.id) || null
+      };
+      threads.push(normalizeV2Thread(thread));
+    }
+  }
+  if (server) {
+    v2RuntimeByServer[server.id] = runtime;
+    // One line the first time a server's protocol is established. `pebble logs`
+    // is the only window into which build the phone is actually running, and
+    // "is the watch on the new bridge or the old one" is otherwise unanswerable
+    // from the glass.
+    if (protocolByServer[server.id] !== 2 && typeof console !== "undefined" && console.log) {
+      console.log("P3 " + BUILD_LABEL + ": " + (server.label || server.id) +
+        " speaks orchestration protocol 2 (" + threads.length + " threads, " +
+        ((snapshot.threads || []).length + (snapshot.archivedThreads || []).length - threads.length) +
+        " subagents hidden)");
+    }
+    protocolByServer[server.id] = 2;
+  }
+  // archivedThreads is a separate list in v2; v1 kept them inline and told
+  // them apart by archivedAt, which every reader below already does.
+  return {
+    snapshotSequence: snapshot.snapshotSequence,
+    projects: snapshot.projects || [],
+    threads: threads
+  };
+}
+
+/* Protocol 1 served a hydrated thread with its messages and an activity log on
+   it. Protocol 2 serves a projection -- the thread, its messages and its runtime
+   requests as separate collections -- so this rebuilds the v1 detail shape from
+   the pieces. Messages need no translation at all: v2 carries the same
+   {id, role, text, streaming, createdAt, updatedAt} the watch already reads. */
+function normalizeV2Projection(server, projection) {
+  var thread = projection && projection.thread;
+  if (!thread) {
+    return null;
+  }
+  var detail = normalizeV2Thread(thread);
+  detail.messages = projection.messages || [];
+  detail.checkpoints = [];
+  detail.proposedPlans = [];
+  detail.activities = v2RequestActivities(projection.runtimeRequests);
+  if (server) {
+    var runtime = v2RuntimeByServer[server.id] || (v2RuntimeByServer[server.id] = {});
+    runtime[thread.id] = {
+      runId: thread.activeRunId || thread.latestRunId || null,
+      requestId: (thread.pendingRuntimeRequest && thread.pendingRuntimeRequest.id) || null
+    };
+  }
+  return detail;
+}
+
+/* The detail screen re-derives approvals from the activity log rather than the
+   rolled-up flags, so that a request which landed since the last poll still
+   reads as needing an answer. Protocol 2 has no log -- it reports the requests
+   themselves, with a status -- so the two events the derivation looks for are
+   synthesized from it. The kinds line up already: T3's ProviderRequestKind is
+   the same command / file-read / file-change vocabulary the watch speaks. */
+function v2RequestActivities(requests) {
+  var activities = [];
+  requests = requests || [];
+  for (var i = 0; i < requests.length; i++) {
+    var request = requests[i];
+    // user_input carries no question text here, so it cannot be rebuilt into a
+    // prompt the watch could answer; auth_refresh is not the user's to approve.
+    if (!request || !request.id || request.kind === "user_input" || request.kind === "auth_refresh") {
+      continue;
+    }
+    activities.push({
+      kind: request.status === "pending" ? "approval.requested" : "approval.resolved",
+      createdAt: request.createdAt || "",
+      payload: { requestId: request.id, requestKind: request.kind, detail: "" }
+    });
+  }
+  return activities;
+}
+
+/** The one place a shell snapshot enters the bridge. */
+function fetchShell(server, callback) {
+  httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
+    if (error) {
+      callback(error);
+      return;
+    }
+    callback(null, normalizeShellSnapshot(server, snapshot));
+  });
+}
+
+/** The protocol-1 command vocabulary, rewritten for protocol 2.
+    Names and shapes both moved: turns became runs and messages, and the two
+    kinds of prompt the watch can answer collapsed into one runtime request.
+    Returns an Error for the commands protocol 2 has no equivalent for, so the
+    watch says so instead of waiting out a request that cannot be built. */
+function translateCommandForV2(server, command) {
+  var runtime = (v2RuntimeByServer[server.id] || {})[command.threadId] || {};
+  switch (command.type) {
+    // Identical in both protocols.
+    case "thread.settle":
+    case "thread.unsettle":
+    case "thread.create":
+      return command;
+    case "thread.turn.interrupt":
+      if (!runtime.runId) {
+        return new Error("Nothing running to interrupt");
+      }
+      // v1 interrupted the thread; v2 interrupts a specific run, which the
+      // call site never knew about -- hence the id harvested at ingest.
+      return {
+        type: "run.interrupt",
+        commandId: command.commandId,
+        threadId: command.threadId,
+        runId: runtime.runId,
+        reason: "user"
+      };
+    case "thread.turn.start": {
+      var message = command.message || {};
+      return {
+        type: "message.dispatch",
+        commandId: command.commandId,
+        threadId: command.threadId,
+        messageId: message.messageId,
+        text: message.text || "",
+        attachments: message.attachments || [],
+        createdBy: "user",
+        creationSource: "mobile"
+      };
+    }
+    case "thread.approval.respond":
+    case "thread.user-input.respond": {
+      var responded = {
+        type: "runtime-request.respond",
+        commandId: command.commandId,
+        threadId: command.threadId,
+        requestId: command.requestId || runtime.requestId
+      };
+      if (command.decision !== undefined) {
+        responded.decision = command.decision;
+      }
+      if (command.answers !== undefined) {
+        responded.answers = command.answers;
+      }
+      if (!responded.requestId) {
+        return new Error("That request is no longer pending");
+      }
+      return responded;
+    }
+    default:
+      // project.create and project.delete are not in protocol 2's command
+      // union at all. Say so rather than dispatching something the server
+      // will reject with a schema dump.
+      return new Error("T3 " + (server.label || "server") + " does not support " + command.type);
+  }
+}
+
+/** Protocol 2 dropped /api/orchestration/dispatch; the same command goes over
+    the WebSocket RPC that both protocols expose. */
+function dispatchCommandOverSocket(server, command, callback) {
+  if (typeof WebSocket === "undefined") {
+    callback(new Error("Phone WebSocket unavailable"));
+    return;
+  }
+  var translated = translateCommandForV2(server, command);
+  if (translated instanceof Error) {
+    callback(translated);
+    return;
+  }
+  httpRequest(server, "POST", T3_WEBSOCKET_TICKET_PATH, null, function(ticketError, issued) {
+    if (ticketError || !issued || !issued.ticket) {
+      callback(ticketError || new Error("T3 did not issue a WebSocket ticket"));
+      return;
+    }
+    var done = false;
+    var socket;
+    var timer;
+
+    function finish(error, value) {
+      if (done) {
+        return;
+      }
+      done = true;
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch (e) {
+        void e;
+      }
+      callback(error, value);
+    }
+
+    try {
+      socket = new WebSocket(webSocketUrl(server, issued.ticket));
+      timer = setTimeout(function() {
+        finish(new Error("T3 did not answer the command"));
+      }, DISPATCH_TIMEOUT_MS);
+      socket.onopen = function() {
+        socket.send(JSON.stringify({
+          _tag: "Request",
+          id: 1,
+          tag: "orchestration.dispatchCommand",
+          payload: translated,
+          headers: []
+        }));
+      };
+      socket.onmessage = function(event) {
+        var response;
+        try {
+          response = JSON.parse(event.data);
+        } catch (e) {
+          finish(new Error("T3 sent an unreadable response"));
+          return;
+        }
+        if (response && response._tag === "Exit" && response.requestId === 1) {
+          var exit = response.exit || {};
+          if (exit._tag === "Success") {
+            finish(null, exit.value === undefined ? null : exit.value);
+          } else {
+            finish(new Error("T3 rejected " + command.type));
+          }
+        }
+      };
+      socket.onerror = function() {
+        finish(new Error("Could not reach " + serverAddress(server)));
+      };
+      socket.onclose = function() {
+        if (!done) {
+          finish(new Error("T3 closed the command"));
+        }
+      };
+    } catch (e) {
+      finish(e);
+    }
+  });
+}
+
 function dispatchCommand(server, command, callback) {
-  httpRequest(server, "POST", T3_DISPATCH_PATH, command, callback);
+  if (protocolByServer[server.id] >= 2) {
+    dispatchCommandOverSocket(server, command, callback);
+    return;
+  }
+  httpRequest(server, "POST", T3_DISPATCH_PATH, command, function(error, value) {
+    // A server we have not read a snapshot from yet still answers a missing
+    // route unambiguously. Remember it so only the first write pays for the
+    // discovery.
+    if (error && error.status === 404) {
+      protocolByServer[server.id] = 2;
+      dispatchCommandOverSocket(server, command, callback);
+      return;
+    }
+    callback(error, value);
+  });
 }
 
 // Resolves the server that owns a namespaced thread id, then hands the builder
@@ -2088,7 +2472,7 @@ function refreshHosts(afterCurrent) {
   var nowMs = Date.now();
   var rows = new Array(servers.length);
   eachLimit(servers, SERVER_CONCURRENCY, function(server, index, next) {
-    httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
+    fetchShell(server, function(error, snapshot) {
       if (error) {
         shellByServer[server.id] = null;
         rows[index] = {
@@ -2251,7 +2635,7 @@ function selectHost(hostId, scope, offset) {
     emit(taggedShell(cached));
     return;
   }
-  httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
+  fetchShell(server, function(error, snapshot) {
     if (error) {
       sendError(error);
       send(makeMessage(CMD_SESSION_END, { total: 0 }));
@@ -3220,7 +3604,7 @@ function resolveProjectRoot(server, callback) {
     resolveServerCwd();
     return;
   }
-  httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
+  fetchShell(server, function(error, snapshot) {
     if (error) {
       callback(error, "");
       return;
@@ -3509,7 +3893,7 @@ function withShellFor(compositeId, callback) {
     callback(null, taggedShell(cached));
     return;
   }
-  httpRequest(server, "GET", T3_SHELL_PATH, null, function(error, snapshot) {
+  fetchShell(server, function(error, snapshot) {
     if (error) {
       callback(error);
       return;
@@ -3748,6 +4132,10 @@ Pebble.addEventListener("webviewclosed", function(event) {
     modelConfigByServer = {};
     changeRequestByThread = {};
     hostViewByServer = {};
+    // A base URL that now points somewhere else may well be a different
+    // server on a different protocol, so the learned protocol goes too.
+    protocolByServer = {};
+    v2RuntimeByServer = {};
     // A host may have been added, removed or relabelled, so nothing the watch
     // is holding can be assumed still current.
     lastHostRow = {};

@@ -24,3 +24,18 @@ jobs:
       - run: node test/protocol.test.js
       - run: node test/bridge.test.js
       - run: node test/bridge.integration.test.js
+
+  quicktakes:
+    name: Quick Takes bridge and protocol
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: quicktakes
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: node --check src/pkjs/index.js
+      - run: node test/protocol.test.js
+      - run: node test/bridge.test.js

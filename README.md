@@ -16,9 +16,12 @@ Drive [T3 Code](https://github.com/pingdotgg/t3code) session threads from a
 Pebble Time 2 over your own tailnet. The watch side is an ordinary Pebble C app;
 the PebbleKit JS bridge on the phone talks directly to T3 Code's REST
 orchestration API. There is no intermediate bridge process, no fork of T3 Code,
-and no server-side patching — it runs on top of the published `t3` command-line
-tool (verified against `t3@0.0.33`). Live model information and pull request
-metadata come over stock T3's authenticated WebSocket RPC.
+and no server-side patching — it runs on top of unmodified T3 Code in either of
+its two orchestration protocols: the published `t3` CLI (protocol 1, verified
+against `t3@0.0.33` and `0.0.38`) and T3 Code Fold or current upstream `main`
+(protocol 2, verified against `t3@0.3.4`). The bridge reads which protocol a
+server speaks off the snapshot it returns. Live model information and pull
+request metadata come over T3's authenticated WebSocket RPC.
 
 | Host overview | Active threads | Thread detail |
 | --- | --- | --- |
@@ -241,3 +244,11 @@ storyboard, and updates the eleven committed PNGs in `docs/screenshots/`. It
 grabs the running QEMU framebuffer directly, so Pebble Tool 5.x cannot quietly
 attach a fresh emulator with no app installed. The script needs native `pebble`,
 Python 3, netcat, and ImageMagick.
+
+## Also in this repo
+
+[`quicktakes/`](quicktakes/) is a second, unrelated Pebble app: **LessWrong Quick
+Takes**, which shows a random handful of the day's
+[LessWrong](https://www.lesswrong.com) shortform posts and lets you read them in
+full on the wrist. It shares this repo's toolchain and conventions and nothing
+else — its own UUID, protocol and bundle. Build it with `./verify-quicktakes.sh`.

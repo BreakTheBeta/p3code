@@ -4,12 +4,100 @@ This document records the T3 Code API surface P3 depends on.
 
 ## Target
 
-Stock, unmodified T3 Code. The published `t3` CLI, installed with `npm install -g t3` or run through `npx t3@latest`.
+Unmodified T3 Code, in either of its two orchestration protocols.
 
-Verified against `t3@0.0.33` and upstream `main` at `949feb61e`
-(`v0.0.34-nightly.20260817.1113`).
+| Protocol | Server | Verified against |
+| --- | --- | --- |
+| 1 | published `t3` CLI | `t3@0.0.33`, `t3@0.0.38` |
+| 2 | T3 Code Fold and current upstream `main` | `t3@0.3.4` (`BreakTheBeta/T3codefold`) |
 
-There is no compatibility branch and no server patch. The earlier fork — which re-added `--auth-token`, legacy `?token=` WebSocket auth, and an `orchestration.getSnapshot` RPC — is no longer used.
+There is no compatibility branch and no server patch in either case. The earlier fork — which re-added `--auth-token`, legacy `?token=` WebSocket auth, and an `orchestration.getSnapshot` RPC — is no longer used, and must not come back.
+
+`./verify-p3.sh` reports which protocol the server it smoke-tested actually spoke. Point it at a specific CLI with `T3_CMD`:
+
+```sh
+./verify-p3.sh                                   # whichever t3 is on PATH
+T3_CMD=/path/to/fold/t3 ./verify-p3.sh           # the other one
+```
+
+## Telling the two apart
+
+The shell snapshot identifies itself. Protocol 2 carries `schemaVersion: 2` and a separate `archivedThreads` array; protocol 1 carries neither and has `updatedAt` instead. Nothing probes a capability endpoint, so nothing can go stale between the probe and the read.
+
+## Protocol 2 differences
+
+### Required header
+
+Every REST call must carry:
+
+```
+x-t3-orchestration-protocol: 2
+```
+
+Without it the orchestration routes answer `400` with an empty body. A protocol-1 server ignores the header, so the bridge sends it unconditionally.
+
+### Required WebSocket parameter
+
+```
+/ws?wsTicket=<ticket>&orchestrationProtocol=2
+```
+
+Without the parameter the upgrade closes with code `1006` and no diagnostic. Protocol 1 ignores it, so it too is unconditional.
+
+### Writes
+
+`POST /api/orchestration/dispatch` **does not exist** on protocol 2; the route is absent from the server bundle entirely and answers `404`. Commands go over the WebSocket RPC instead:
+
+```json
+{ "_tag": "Request", "id": 1, "tag": "orchestration.dispatchCommand",
+  "payload": { "type": "...", "commandId": "...", "threadId": "..." }, "headers": [] }
+```
+
+Protocol 1 keeps the REST route, which is one round trip instead of a ticket plus a socket, so the bridge keeps using it there.
+
+### Command vocabulary
+
+| Protocol 1 | Protocol 2 |
+| --- | --- |
+| `thread.settle` | unchanged |
+| `thread.unsettle` | unchanged |
+| `thread.create` | unchanged |
+| `thread.turn.start` | `message.dispatch` — the nested `message` flattens into the command, plus `createdBy`/`creationSource` |
+| `thread.turn.interrupt` | `run.interrupt` — additionally requires `runId` |
+| `thread.approval.respond` | `runtime-request.respond` with `decision` |
+| `thread.user-input.respond` | `runtime-request.respond` with `answers` |
+| `project.create` | **no equivalent** |
+| `project.delete` | **no equivalent** |
+
+`run.interrupt` needs a run id that the protocol-1 command never carried, so the bridge harvests `activeRunId`/`latestRunId` per thread while normalizing the snapshot.
+
+### Thread read model
+
+| Protocol 1 | Protocol 2 |
+| --- | --- |
+| `latestTurn.{state,requestedAt,startedAt,completedAt}` | `status`, `activityRunStatus`, `latestRunRequestedAt`, `latestRunStartedAt`, `latestRunCompletedAt` |
+| `session.{status,providerName,lastError,updatedAt}` | `status`/`activityRunStatus`, `providerInstanceId`, `lastError`, `updatedAt` |
+| `hasPendingApprovals`, `hasPendingUserInput` | one `pendingRuntimeRequest` with a `kind` |
+| `backgroundLiveness` | `pendingBackgroundTasks` |
+| archived threads inline, flagged by `archivedAt` | separate `archivedThreads` array |
+
+A pending request of kind `user_input` is a question; `auth_refresh` is neither a question nor an approval; anything else is an approval. The server classifies them the same way and warns that clients must agree.
+
+### Thread detail
+
+| Protocol 1 | Protocol 2 |
+| --- | --- |
+| `{ snapshotSequence, thread }` | `{ snapshotSequence, projection }` — **no `thread` key** |
+| `thread.messages` | `projection.messages` (same shape) |
+| `thread.activities` event log | `projection.runtimeRequests`, current state with a `status` |
+
+Reading `response.thread` on protocol 2 yields `undefined`, which surfaces as "Thread not found" for every thread and an empty summary on every row.
+
+Approvals are rebuilt from `runtimeRequests`: `status: "pending"` becomes an `approval.requested`, anything else an `approval.resolved`. `kind` needs no mapping — `ProviderRequestKind` is `command` / `file-read` / `file-change` / `mcp-elicitation` / `permission`. A `user_input` request carries no question text on this route, so the watch cannot rebuild an answerable prompt from it; the thread still reads as needing attention from the shell flags.
+
+### Subagent threads
+
+Protocol 2 represents a provider's subagents as real child threads and includes them in the shell list. They carry `lineage.relationshipToParent === "subagent"` and are titled by their working directory, so they surface as rows like `/root/<something>` that the user never started. T3's own thread lists filter them out with that exact test, and so does P3. A `fork` is a thread the user genuinely branched and is kept.
 
 ## Required API Surface
 

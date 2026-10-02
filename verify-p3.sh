@@ -104,9 +104,12 @@ if [[ "$unauthenticated_status" != "401" ]]; then
   exit 1
 fi
 
+# The same header the bridge sends. An orchestration protocol 2 server (T3 Code
+# Fold, current upstream) answers 400 without it; protocol 1 ignores it.
 curl --max-time 10 -sS \
   -H "Authorization: Bearer $SMOKE_TOKEN" \
   -H "Accept: application/json" \
+  -H "x-t3-orchestration-protocol: 2" \
   "$SMOKE_BASE_URL/api/orchestration/shell" >/tmp/p3-smoke-snapshot.json
 
 node <<'NODE'
@@ -116,6 +119,14 @@ if (!Array.isArray(snapshot.projects) || !Array.isArray(snapshot.threads)) {
   console.error("Shell snapshot did not include projects and threads arrays.");
   process.exit(1);
 }
+// Both protocols are supported, so report which one this server actually spoke
+// rather than asserting one of them.
+const protocol = snapshot.schemaVersion >= 2 ? 2 : 1;
+if (protocol === 2 && !Array.isArray(snapshot.archivedThreads)) {
+  console.error("Protocol 2 snapshot did not include archivedThreads.");
+  process.exit(1);
+}
+console.log(`Shell snapshot is orchestration protocol ${protocol}.`);
 NODE
 
 PBW_PATH="$DIST_DIR/p3.pbw" \
@@ -147,7 +158,8 @@ const manifest = {
       "pebble build",
       "stock T3 Code issues a bearer access token via t3 auth session issue",
       "stock T3 Code rejects unauthenticated /api/orchestration/shell with 401",
-      "stock T3 Code serves /api/orchestration/shell to a bearer token",
+      "T3 Code serves /api/orchestration/shell to a bearer token",
+      "the shell snapshot is a supported orchestration protocol (1 or 2)",
     ],
   },
 };
@@ -155,6 +167,6 @@ const manifest = {
 fs.writeFileSync(process.env.MANIFEST_PATH, `${JSON.stringify(manifest, null, 2)}\n`);
 NODE
 
-echo "Verified P3 against stock T3 Code."
+echo "Verified P3 against T3 Code."
 echo "Installable PBW: $DIST_DIR/p3.pbw"
 echo "Manifest: $DIST_DIR/p3.manifest.json"

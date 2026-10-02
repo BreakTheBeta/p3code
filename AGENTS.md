@@ -1,5 +1,9 @@
 # Agent Notes
 
+This repo holds two Pebble apps. `p3/` is P3, the T3 Code client. `quicktakes/`
+is LessWrong Quick Takes, which is independent of it: its own UUID, protocol and
+bundle, sharing only the toolchain and the conventions below.
+
 ## Build and Test
 
 Run Pebble bridge checks and build from `p3/`:
@@ -20,7 +24,25 @@ cp p3/build/p3.pbw dist/p3.pbw
 
 ## T3 Code
 
-The app runs against stock T3 Code (the published `t3` CLI). Do not patch T3 Code, and do not reintroduce `--auth-token` or `orchestration.getSnapshot`; both were fork-only. The bridge authenticates with a bearer token from `t3 auth session issue` and uses the REST routes documented in `docs/t3code-compatibility.md`.
+The app runs against unmodified T3 Code. Do not patch T3 Code, and do not reintroduce `--auth-token` or `orchestration.getSnapshot`; both were fork-only. The bridge authenticates with a bearer token from `t3 auth session issue` and uses the REST routes documented in `docs/t3code-compatibility.md`.
+
+### Two orchestration protocols
+
+P3 supports both, and must keep doing so. Published stock `t3` 0.0.38 speaks **protocol 1**. T3 Code Fold (`BreakTheBeta/T3codefold`, `t3` 0.3.4) and current upstream `main` speak **protocol 2**. `./verify-p3.sh` runs against whichever CLI `t3_resolve` finds and prints which protocol the server spoke; point it at the other with `T3_CMD=<path to t3> ./verify-p3.sh` and run it both ways before believing a change to any of this.
+
+The protocol is read off the snapshot itself — v2 carries `schemaVersion` and splits `archivedThreads` out, v1 carries neither. That is a fact about the payload in hand, so there is no capability probe to go stale. `normalizeShellSnapshot()` is the single place a snapshot enters the bridge, via `fetchShell()`; it records the protocol per server and, for v2, rewrites the threads into the v1 shape. Everything downstream — the state bands, settlement, snooze, pinning — reads one model and never learns which server it came from. Keep it that way: branching per protocol below that line is how the two derivations drift apart.
+
+What protocol 2 changed, and where it is handled:
+
+- **A required header.** `x-t3-orchestration-protocol: 2` on every REST call, or the read is a bare 400 with no body. A protocol-1 server ignores it, so it is sent unconditionally rather than gated.
+- **A required WebSocket parameter.** `/ws?wsTicket=...&orchestrationProtocol=2`, or the upgrade closes 1006 with no explanation. Also ignored by protocol 1, so also unconditional.
+- **Writes moved off REST.** `/api/orchestration/dispatch` does not exist on protocol 2 — the string is not in the server bundle at all. The same command goes over the WebSocket RPC as `orchestration.dispatchCommand`. Protocol 1 keeps its one-round-trip REST write; `dispatchCommand()` picks by learned protocol and falls back on a 404 for a server no snapshot has been read from yet.
+- **The command vocabulary was renamed and reshaped.** `translateCommandForV2()` owns this. `thread.settle`, `thread.unsettle` and `thread.create` are identical. `thread.turn.start` → `message.dispatch` (the message flattens into the command). `thread.turn.interrupt` → `run.interrupt`, which needs a `runId` the v1 command never carried — hence the `threadId -> runId` roster `normalizeShellSnapshot()` harvests at ingest. `thread.approval.respond` and `thread.user-input.respond` both collapse into `runtime-request.respond`. **`project.create` and `project.delete` have no protocol-2 equivalent at all**; the translation returns an Error so the watch says so rather than waiting out a schema rejection.
+- **The thread read model was reshaped.** `latestTurn` became `latestRun*` plus `activityRunStatus`/`status`; `session` became `providerInstanceId`/`status`/`lastError`; `hasPendingApprovals`/`hasPendingUserInput` became one `pendingRuntimeRequest`; `backgroundLiveness` became `pendingBackgroundTasks`. The server classifies pending requests itself and warns that clients must agree: `user_input` is a question, `auth_refresh` is neither a question nor an approval, everything else is an approval.
+
+**The thread detail route changed shape too, and it is a separate fix from the shell.** Protocol 1 answered `{ snapshotSequence, thread }` with the messages and an activity log hanging off the thread. Protocol 2 answers `{ snapshotSequence, projection }` with **no `thread` key at all**, so `fetchThreadDetail()` read every thread as "Thread not found": nothing would open and no row had a summary. `normalizeV2Projection()` rebuilds the v1 detail shape from `projection.thread`, `projection.messages` and `projection.runtimeRequests`. Messages need no translation — v2 already carries the same `{id, role, text, streaming, createdAt, updatedAt}`. The detail screen re-derives approvals from an activity log that protocol 2 does not have, so `v2RequestActivities()` synthesizes the two events the derivation looks for out of the requests themselves; the kinds already line up, because T3's `ProviderRequestKind` is the same `command` / `file-read` / `file-change` vocabulary the watch speaks. A `user_input` request carries no question text on that route, so it is skipped rather than rebuilt into a prompt that would render empty — such a thread still reads as "needs you" from the shell flags.
+
+**Protocol 2 puts a provider's subagents in the shell list as real threads, and they must not become rows.** They are `lineage.relationshipToParent === "subagent"`, created by the agent rather than the user, and titled by their working directory — so one Codex run buried the watch in rows called `/root/<something>` that nobody started and nothing useful can be done to. On one live server that was 88 of 243 threads. T3's own code filters them with exactly this test (`includeSubagents || relationshipToParent !== "subagent"`), so `isSubagentThread()` uses it too. A `fork` is a thread the user really did branch and keeps its row; only `subagent` is hidden.
 
 `./verify-p3.sh` runs the bridge tests, builds the PBW, and smoke-tests against a real `t3 serve` on a throwaway data directory.
 
@@ -80,6 +102,62 @@ Multi-host setup goes through one pasteable line per machine, `p3code1|<label>|<
 
 `run-p3-tailscale.sh` defaults to binding the Tailscale IP over plain HTTP. `P3_TAILSCALE_SERVE=1` opts into publishing loopback over tailnet HTTPS via `tailscale serve --bg` instead, which is what reaches a T3 Code desktop app that only listens on `127.0.0.1`. Keep the default path unchanged; the flag is additive. Auth is the same bearer token in both modes — do not add a pairing exchange to the bridge.
 
+## LessWrong Quick Takes
+
+Run its checks and build from `quicktakes/`, or `./verify-quicktakes.sh` for all
+of it plus staging `dist/quicktakes.pbw`:
+
+```sh
+node --check src/pkjs/index.js
+node test/protocol.test.js
+node test/bridge.test.js
+pebble build
+```
+
+It follows the same `protocol.json` discipline as P3 — its own copy of
+`tools/gen-protocol.js`, its own generated blocks, its own
+`test/protocol.test.js`. The two protocols are unrelated and must not be merged;
+the only thing they share is the shape of the generator.
+
+The phone asks lesswrong.com's GraphQL endpoint for the 60 most recent
+`view: "shortform"` comments, which is what the site calls Quick Takes. That view
+is only roughly date-ordered and mixes in much older comments, so the day filter
+is ours to apply, in `windowTakes()`. A window too quiet to sample from widens to
+`WIDEN_HOURS` once rather than showing an empty list, and reports the span it
+actually used — `CMD_TAKE_END` carries `window` for exactly that. A working
+request that finds nothing is not an error and must not be reported as one.
+
+The phone keeps the whole window it fetched, not only the twelve rows it sent.
+That is what makes `CMD_SHUFFLE` free: a re-deal costs no HTTP request, and
+opening a take costs none either because its text is already on the phone. Keep
+it that way — a shuffle that refetched would be both slower and a different list.
+
+**Every text limit in the bridge is a UTF-8 byte budget, never a character
+count.** The watch's fields are fixed byte arrays, and Pebble's text renderer
+draws nothing at all — not a truncated string, nothing — for a string that is
+not valid UTF-8. `compact()` counting JS characters is what made the first build
+ship with a list where every preview was blank space: 120 characters weighed 122
+bytes, the watch's 121-byte buffer cut the trailing ellipsis in half, and the
+field silently stopped rendering while `strlen` still read 120. `CMD_BODY_CHUNK`
+carries an explicit byte `offset` for the same reason — the watch memcpys each
+piece there, so splitting by character index would desynchronize at the first
+non-ASCII character and assemble a body with a hole in it that no single message
+would look wrong in. `compact()` and `splitBody()` both measure bytes and never
+split a character; `trim_partial_utf8()` on the watch is the net that turns a
+future drift into shortened text rather than into nothing. `protocol.test.js`
+asserts both are still there.
+
+Nothing on either screen animates at rest, for the same reason as P3's home
+screen. The only timer runs while `s_busy` is non-zero and repaints
+`rail_update_proc`'s two-pixel accent rail, not a panel; the footer's sync age
+rides `MINUTE_UNIT`. Every failure path clears the whole busy mask — a branch
+that cleared only its own flag would leave the rail sweeping forever.
+
+The emery emulator is the way to exercise the screens the phone cannot reach:
+`pebble install --emulator emery`, then `pebble emu-button --emulator emery click
+select` and `pebble screenshot --emulator emery`. pypkjs makes the real GraphQL
+request, so the emulator shows live takes.
+
 ## Watch Install
 
 `pebble` is Core Devices' pebble-tool 5.x, installed natively with `uv tool install --python 3.13 pebble-tool` and then `pebble sdk install latest`. It is no longer the `rebble/pebble-sdk` Docker wrapper, so the old rule about repo-relative PBW paths is gone — absolute host paths work. The previous wrapper is kept at `~/.local/bin/pebble-docker` if a build ever has to be reproduced against SDK 4.3.
@@ -101,7 +179,7 @@ Direct Core Devices install:
 ```sh
 node - <<'NODE'
 const fs = require("fs");
-const phone = process.env.PEBBLE_PHONE || "100.76.64.6";
+const phone = process.env.PEBBLE_PHONE || "100.85.228.9";
 const pbwPath = process.env.PBW_PATH || "dist/p3.pbw";
 const pbw = fs.readFileSync(pbwPath);
 const payload = Buffer.concat([Buffer.from([0x04]), pbw]);
@@ -145,7 +223,15 @@ ws.addEventListener("error", (event) => {
 NODE
 ```
 
-Known working phone Tailscale IP for Will's S23 Ultra: `100.76.64.6`.
+The phone is Will's Z Fold 8 Ultra, `100.85.228.9` — that is where the Core
+Devices dev server runs and what the watch pairs with. The S23 Ultra
+(`100.76.64.6`) was the old one and has been off the tailnet since August 2026;
+it is kept here only so an old command line found in a script is recognisable,
+not as a fallback. Check `tailscale status` before assuming any of it.
+
+The normal `pebble install --phone 100.85.228.9 <pbw>` path works against the
+Fold, so the direct WebSocket install below is a fallback rather than the usual
+route.
 
 Protocol notes:
 

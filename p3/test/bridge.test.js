@@ -1207,6 +1207,326 @@ async function main() {
     "must not infer the filesystem root",
   )
 
+  // ------------------------------------------------ orchestration protocol 2
+  //
+  // T3 Code Fold (and current upstream) serve protocol 2: the thread read model
+  // was reshaped and writes moved off REST entirely. A v2 snapshot is
+  // translated back into the v1 shape at ingest, so every derivation above this
+  // line keeps working against both without knowing which it is looking at.
+
+  /** A thread as a protocol-2 shell route actually returns it. Field-for-field
+      from a live T3 Code Fold 0.3.4 server. */
+  function v2Thread(overrides = {}) {
+    return {
+      id: "v2_t1",
+      projectId: "proj_1",
+      title: "Fold thread",
+      providerInstanceId: "codex",
+      modelSelection: { instanceId: "codex", model: "gpt-5.6-sol" },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      branch: null,
+      worktreePath: null,
+      status: "idle",
+      activityRunStatus: null,
+      activeRunId: null,
+      latestRunId: "run:thread:v2_t1:ordinal:1",
+      latestRunRequestedAt: iso(60000),
+      latestRunStartedAt: iso(59000),
+      latestRunCompletedAt: iso(58000),
+      pendingRuntimeRequest: null,
+      pendingBackgroundTasks: [],
+      latestUserMessageAt: iso(60000),
+      hasActionableProposedPlan: false,
+      lastError: null,
+      createdAt: iso(10 * DAY_MS),
+      updatedAt: iso(58000),
+      archivedAt: null,
+      settledOverride: null,
+      settledAt: null,
+      snoozedUntil: null,
+      snoozedAt: null,
+      pinnedAt: null,
+      deletedAt: null,
+      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: "v2_t1" },
+      ...overrides,
+    }
+  }
+
+  const v2Server = { id: "s1", label: "fold", baseUrl: "http://" + HOST_A, token: "t" }
+
+  // The snapshot says which protocol it is, so no capability probe can go stale.
+  assert.strictEqual(context.isV2Snapshot({ schemaVersion: 2 }), true)
+  assert.strictEqual(context.isV2Snapshot(shellSnapshot()), false)
+
+  context.protocolByServer = {}
+  context.v2RuntimeByServer = {}
+  const v2Snapshot = context.normalizeShellSnapshot(v2Server, {
+    schemaVersion: 2,
+    snapshotSequence: 3,
+    projects: [{ id: "proj_1", title: "Fold", workspaceRoot: "/repo/fold" }],
+    threads: [
+      v2Thread({ id: "v2_idle" }),
+      v2Thread({ id: "v2_running", status: "running", activityRunStatus: "running",
+                 activeRunId: "run:thread:v2_running:ordinal:2" }),
+      v2Thread({ id: "v2_starting", status: "queued", activityRunStatus: "starting" }),
+      v2Thread({ id: "v2_failed", status: "failed", lastError: "boom" }),
+      v2Thread({ id: "v2_approval", pendingRuntimeRequest: { id: "req_1", kind: "exec", createdAt: iso(1000) } }),
+      v2Thread({ id: "v2_question", pendingRuntimeRequest: { id: "req_2", kind: "user_input", createdAt: iso(1000) } }),
+      // An auth refresh blocks like an approval but is not one, and the server
+      // warns that both sides have to classify it the same way.
+      v2Thread({ id: "v2_auth", pendingRuntimeRequest: { id: "req_3", kind: "auth_refresh", createdAt: iso(1000) } }),
+      v2Thread({ id: "v2_monitor", pendingBackgroundTasks: [{ taskId: "bg1" }] }),
+      // A provider's own subagent. Protocol 2 puts these in the shell list and
+      // protocol 1 never did; they are titled by their working directory, so a
+      // single Codex run buries the watch in rows called "/root/<something>"
+      // that the user never started. T3's sidebar hides them on exactly this
+      // test, so the watch has to as well.
+      v2Thread({
+        id: "v2_subagent", title: "/root/treasure_ux", createdBy: "agent", creationSource: "provider",
+        lineage: { parentThreadId: "v2_idle", relationshipToParent: "subagent", rootThreadId: "v2_idle" },
+      }),
+      // A fork is a thread the user really did branch, and it keeps its row.
+      v2Thread({
+        id: "v2_fork", title: "Try another approach",
+        lineage: { parentThreadId: "v2_idle", relationshipToParent: "fork", rootThreadId: "v2_idle" },
+      }),
+    ],
+    // v2 splits archived threads into their own list; v1 kept them inline and
+    // told them apart by archivedAt, which every reader downstream still does.
+    archivedThreads: [v2Thread({ id: "v2_archived", archivedAt: iso(5000) })],
+  })
+
+  assert.strictEqual(context.protocolByServer["s1"], 2, "protocol is learned from the snapshot")
+  assert.strictEqual(v2Snapshot.threads.length, 10,
+    "archived threads rejoin the list and the subagent is dropped")
+  assert.ok(!v2Snapshot.threads.some((t) => t.id === "v2_subagent"), "subagent threads are not rows")
+  assert.ok(!v2Snapshot.threads.some((t) => String(t.title).startsWith("/root")))
+  assert.ok(v2Snapshot.threads.some((t) => t.id === "v2_fork"), "a fork is a real thread")
+  // Dropped from the roster too, so a stale id cannot be dispatched against.
+  assert.strictEqual(context.v2RuntimeByServer["s1"].v2_subagent, undefined)
+  assert.ok(v2Snapshot.threads.some((t) => t.id === "v2_archived" && t.archivedAt))
+
+  const byId = {}
+  for (const thread of v2Snapshot.threads) byId[thread.id] = thread
+
+  // The v1 shape the rest of the bridge reads, rebuilt from v2's fields.
+  assert.strictEqual(byId.v2_running.session.status, "running")
+  assert.strictEqual(byId.v2_starting.session.status, "starting")
+  assert.strictEqual(byId.v2_failed.session.status, "error")
+  assert.strictEqual(byId.v2_failed.session.lastError, "boom")
+  assert.strictEqual(byId.v2_idle.session.status, "ready")
+  assert.strictEqual(byId.v2_idle.session.providerName, "codex")
+
+  // "idle" describes the thread, not the run that last finished on it.
+  assert.strictEqual(byId.v2_idle.latestTurn.state, "completed")
+  assert.strictEqual(byId.v2_idle.latestTurn.startedAt, iso(59000))
+  assert.strictEqual(byId.v2_failed.latestTurn.state, "error")
+  assert.strictEqual(
+    context.normalizeShellSnapshot(null, {
+      schemaVersion: 2, snapshotSequence: 1, projects: [], archivedThreads: [],
+      threads: [v2Thread({ latestRunId: null, latestRunRequestedAt: null })],
+    }).threads[0].latestTurn,
+    null,
+    "a thread that has never run gets no turn at all",
+  )
+
+  assert.strictEqual(byId.v2_approval.hasPendingApprovals, true)
+  assert.strictEqual(byId.v2_approval.hasPendingUserInput, false)
+  assert.strictEqual(byId.v2_question.hasPendingUserInput, true)
+  assert.strictEqual(byId.v2_question.hasPendingApprovals, false)
+  assert.strictEqual(byId.v2_auth.hasPendingApprovals, false, "auth refresh is not an approval")
+  assert.strictEqual(byId.v2_auth.hasPendingUserInput, false)
+  assert.strictEqual(byId.v2_monitor.backgroundLiveness, "monitoring")
+  assert.strictEqual(byId.v2_idle.backgroundLiveness, null)
+
+  // The point of normalizing rather than branching: the existing derivations
+  // read a v2 thread without knowing it is one.
+  assert.strictEqual(context.threadState(byId.v2_running, NOW), "run")
+  assert.strictEqual(context.threadState(byId.v2_starting, NOW), "run")
+  assert.strictEqual(context.threadState(byId.v2_approval, NOW), "needs")
+  assert.strictEqual(context.threadState(byId.v2_question, NOW), "needs")
+  assert.strictEqual(context.threadState(byId.v2_monitor, NOW), "monitor")
+  assert.strictEqual(context.threadState(byId.v2_failed, NOW), "err")
+  assert.strictEqual(context.threadState(byId.v2_idle, NOW), "idle")
+
+  // A v1 snapshot must pass through untouched, which is what keeps stock T3 on
+  // its tested path.
+  const v1Snapshot = shellSnapshot()
+  assert.strictEqual(context.normalizeShellSnapshot({ id: "s9" }, v1Snapshot), v1Snapshot)
+  assert.strictEqual(context.protocolByServer["s9"], 1)
+
+  // --- the command vocabulary -------------------------------------------
+
+  // Identical in both protocols, so they must not be rewritten.
+  for (const type of ["thread.settle", "thread.unsettle", "thread.create"]) {
+    const command = { type, commandId: "c", threadId: "v2_running" }
+    assert.strictEqual(context.translateCommandForV2(v2Server, command), command, type)
+  }
+
+  // v1 interrupted a thread; v2 interrupts a specific run, and the call site
+  // never knew the run id -- it comes from the snapshot ingest.
+  const interrupt = context.translateCommandForV2(v2Server,
+    { type: "thread.turn.interrupt", commandId: "c1", threadId: "v2_running", createdAt: iso(0) })
+  assert.strictEqual(interrupt.type, "run.interrupt")
+  assert.strictEqual(interrupt.runId, "run:thread:v2_running:ordinal:2")
+
+  // Nothing running means there is no run to interrupt, and saying so beats
+  // dispatching a command the server will reject on a missing field.
+  const nothingToStop = context.translateCommandForV2(v2Server,
+    { type: "thread.turn.interrupt", commandId: "c1", threadId: "nope" })
+  assert.ok(nothingToStop.message && !nothingToStop.type)
+
+  const reply = context.translateCommandForV2(v2Server, {
+    type: "thread.turn.start", commandId: "c2", threadId: "v2_idle",
+    message: { messageId: "m1", role: "user", text: "go on", attachments: [] },
+    runtimeMode: "full-access", interactionMode: "default",
+  })
+  assert.strictEqual(reply.type, "message.dispatch")
+  assert.strictEqual(reply.text, "go on")
+  assert.strictEqual(reply.messageId, "m1")
+  assert.strictEqual(reply.creationSource, "mobile")
+
+  // Both kinds of prompt the watch can answer collapsed into one command.
+  const approved = context.translateCommandForV2(v2Server, {
+    type: "thread.approval.respond", commandId: "c3", threadId: "v2_approval",
+    requestId: "req_1", decision: "approve", createdAt: iso(0),
+  })
+  assert.strictEqual(approved.type, "runtime-request.respond")
+  assert.strictEqual(approved.decision, "approve")
+  assert.strictEqual(approved.createdAt, undefined, "v2 does not take createdAt here")
+  const answered = context.translateCommandForV2(v2Server, {
+    type: "thread.user-input.respond", commandId: "c4", threadId: "v2_question",
+    requestId: "req_2", answers: { q1: "yes" },
+  })
+  assert.strictEqual(answered.type, "runtime-request.respond")
+  assertJsonEqual(answered.answers, { q1: "yes" })
+
+  // protocol 2 has no project commands at all, so the watch has to be told
+  // rather than left waiting on a schema rejection.
+  const refused = context.translateCommandForV2(v2Server, { type: "project.create", commandId: "c5" })
+  assert.ok(refused.message && !refused.type)
+  assert.match(refused.message, /does not support project\.create/)
+
+  // --- the thread detail projection --------------------------------------
+  //
+  // Protocol 1 served a hydrated thread with its messages and an activity log
+  // on it. Protocol 2 serves a projection with no `thread` key at all, which
+  // the bridge read as "Thread not found" -- every thread refused to open, and
+  // no row had a summary.
+
+  const projection = context.normalizeV2Projection(v2Server, {
+    thread: v2Thread({ id: "v2_detail", title: "Branch check" }),
+    // v2 messages need no translation: same id/role/text/streaming/stamps.
+    messages: [
+      { id: "m1", role: "user", text: "What branch is this?", streaming: false,
+        createdAt: iso(90000), updatedAt: iso(90000), attachments: [] },
+      { id: "m2", role: "assistant", text: "Did the thing. All done.", streaming: false,
+        createdAt: iso(80000), updatedAt: iso(80000), attachments: [] },
+    ],
+    runtimeRequests: [
+      { id: "rq1", kind: "command", status: "pending", createdAt: iso(5000) },
+      { id: "rq2", kind: "file-change", status: "resolved", createdAt: iso(9000) },
+      // No question text travels with these, so they cannot be rebuilt into a
+      // prompt the watch could answer; auth_refresh is not the user's to approve.
+      { id: "rq3", kind: "user_input", status: "pending", createdAt: iso(4000) },
+      { id: "rq4", kind: "auth_refresh", status: "pending", createdAt: iso(3000) },
+    ],
+  })
+
+  assert.ok(projection, "a projection must rebuild into a thread")
+  assert.strictEqual(projection.title, "Branch check")
+  assert.strictEqual(projection.messages.length, 2)
+  // The v1 read model is rebuilt here too, not only on the shell route.
+  assert.strictEqual(projection.session.status, "ready")
+  assert.match(context.summaryFromMessages(projection.messages.map(context.toPebbleMessage)),
+    /Did the thing/, "an empty summary is the symptom the watch actually shows")
+  assertJsonEqual(projection.messages.map(context.toPebbleMessage).map((m) => m.type),
+    ["user", "assistant"])
+
+  // The detail screen re-derives approvals from the log so a request that
+  // landed since the last poll still reads as needing an answer.
+  const approvals = context.derivePendingApprovals(projection.activities)
+  assert.strictEqual(approvals.length, 1)
+  assert.strictEqual(approvals[0].requestId, "rq1")
+  assert.strictEqual(approvals[0].requestKind, "command")
+  assert.ok(!projection.activities.some((a) => a.payload.requestId === "rq3"))
+  assert.ok(!projection.activities.some((a) => a.payload.requestId === "rq4"))
+
+  assert.strictEqual(context.normalizeV2Projection(v2Server, { thread: null }), null)
+
+  // --- on the wire ------------------------------------------------------
+
+  storedSettings = settingsFor([{ id: "s1", label: "fold", baseUrl: "http://" + HOST_A, token: "t" }])
+  shells = {
+    [HOST_A]: {
+      schemaVersion: 2,
+      snapshotSequence: 1,
+      projects: [{ id: "proj_1", title: "Fold", workspaceRoot: "/repo/fold" }],
+      threads: [v2Thread({ id: "v2_running", status: "running", activityRunStatus: "running",
+                           activeRunId: "run:1" })],
+      archivedThreads: [],
+    },
+  }
+  requests = []
+  sentMessages = []
+  webSocketRequests = []
+  context.shellByServer = {}
+  context.protocolByServer = {}
+  context.v2RuntimeByServer = {}
+  context.refreshHosts()
+  await waitFor(() => sentMessages.some((m) => m.cmd === CMD.hostEnd), "a protocol 2 host refresh")
+
+  const shellRead = requests.find((r) => r.pathname === "/api/orchestration/shell")
+  // A protocol-2 server answers 400 without this and a protocol-1 server
+  // ignores it, which is why it is sent unconditionally.
+  assert.strictEqual(shellRead.headers["x-t3-orchestration-protocol"], "2")
+  assert.strictEqual(context.protocolByServer["s1"], 2, "learned from the snapshot, not probed")
+
+  // A write against a protocol-2 host goes over the socket, translated, and
+  // must not touch the REST route that server does not have.
+  requests = []
+  webSocketRequests = []
+  context.interruptSession("s1::v2_running")
+  await waitFor(
+    () => webSocketRequests.some((w) => w.requests.some((r) => r.tag === "orchestration.dispatchCommand")),
+    "a dispatch over the socket",
+  )
+  const socketCall = webSocketRequests
+    .reduce((all, w) => all.concat(w.requests), [])
+    .find((r) => r.tag === "orchestration.dispatchCommand")
+  assert.strictEqual(socketCall.payload.type, "run.interrupt")
+  assert.strictEqual(socketCall.payload.runId, "run:1")
+  assert.ok(
+    !requests.some((r) => r.pathname === "/api/orchestration/dispatch"),
+    "protocol 2 deleted the REST dispatch route; using it is a 404",
+  )
+  const upgradeUrl = webSocketRequests[webSocketRequests.length - 1].url
+  // Without this the upgrade closes 1006 on a protocol-2 server.
+  assert.match(upgradeUrl, /orchestrationProtocol=2/)
+  assert.match(upgradeUrl, /wsTicket=/)
+
+  // The stock path must be untouched: a protocol-1 host still writes over REST.
+  storedSettings = settingsFor([{ id: "s1", label: "stock", baseUrl: "http://" + HOST_A, token: "t" }])
+  shells = { [HOST_A]: shellSnapshot({ threads: [shellThread({ id: "t1" })] }) }
+  requests = []
+  sentMessages = []
+  webSocketRequests = []
+  dispatches = []
+  context.shellByServer = {}
+  context.protocolByServer = {}
+  context.v2RuntimeByServer = {}
+  context.refreshHosts()
+  await waitFor(() => sentMessages.some((m) => m.cmd === CMD.hostEnd), "a protocol 1 host refresh")
+  assert.strictEqual(context.protocolByServer["s1"], 1)
+  context.settleSession("s1::t1", true)
+  await waitFor(() => dispatches.length > 0, "a REST dispatch")
+  assert.strictEqual(dispatches[0].type, "thread.settle")
+  assert.ok(
+    !webSocketRequests.some((w) => w.requests.some((r) => r.tag === "orchestration.dispatchCommand")),
+    "a protocol 1 server must keep its one-round-trip REST write",
+  )
+
   console.log("phone bridge tests passed")
 }
 
