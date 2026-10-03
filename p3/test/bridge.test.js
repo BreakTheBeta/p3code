@@ -665,6 +665,11 @@ async function main() {
     ["settled-recent", "stale-touched"],
   )
 
+  // The pin has to survive onto the row, or the watch cannot tell where the
+  // block the phone just sorted to the front stops.
+  assert.strictEqual(context.itemFields({ id: "a", pinned: true }, 0, 1).pinned, 1)
+  assert.strictEqual(context.itemFields({ id: "a" }, 0, 1).pinned, 0)
+
   // ------------------------------------------------------------- roll-ups
   // The counts speak for the whole machine, so they must not stop at the
   // page size: a thread past MAX_SESSIONS still gets to raise its hand.

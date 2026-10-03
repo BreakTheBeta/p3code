@@ -48,6 +48,8 @@ What protocol 2 changed, and where it is handled:
 
 Thread lists are scoped: `SCOPE_ACTIVE` (0) or `SCOPE_SETTLED` (1), carried on `CMD_SELECT_HOST` with an offset. `CMD_SESSION_END` reports `scope`, `offset`, `matched` (the scope's total) and `other` (the opposite scope's total), which is everything the watch needs to label its footer rows without a second request. Footer rows are derived in `rebuild_footers()`, never sent.
 
+The thread window's `MenuLayer` has three sections — `SECTION_PINNED`, `SECTION_THREADS`, `SECTION_PROJECTS` — and all three exist unconditionally, because an empty section costs no rows and no header and constant indices are worth more than a saved branch. The two thread sections are one array, `s_sessions`, split at `s_pinned_count`; `thread_row_session()` is the only thing that maps a `MenuIndex` back to a thread, so add rows through it rather than indexing by `cell_index->row`. `s_pinned_count` is the *leading run* of `pinned` rows, not a total: the phone sorts pins to the front, and counting the run means a phone that ever broke that promise puts the stray row in the ordinary section with its marker still drawn instead of mislabelling everything between. Both thread headers appear only when something is pinned, so an unpinned host looks exactly as it did before the section existed.
+
 T3's `backgroundLiveness: "monitoring"` is its own watch state, `monitor`, not
 idle and not actively running. It follows the sidebar's priority after error
 and Plan Ready but before idle. Monitoring uses Casio green without a pulse or

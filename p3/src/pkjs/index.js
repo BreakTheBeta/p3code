@@ -47,6 +47,7 @@ var KEY_MODEL = "model";
 var KEY_INSTANCE_ID = "instance_id";
 var KEY_IS_DEFAULT = "is_default";
 var KEY_C_MONITOR = "c_monitor";
+var KEY_PINNED = "pinned";
 
 var CMD_REFRESH = 1;
 var CMD_SESSION_ITEM = 2;
@@ -1617,6 +1618,7 @@ function makeMessage(command, fields) {
   if (fields.matched !== undefined) message[KEY_MATCHED] = fields.matched;
   if (fields.other !== undefined) message[KEY_OTHER] = fields.other;
   if (fields.settled !== undefined) message[KEY_SETTLED] = fields.settled;
+  if (fields.pinned !== undefined) message[KEY_PINNED] = fields.pinned;
   if (fields.path !== undefined) message[KEY_PATH] = fields.path;
   if (fields.name !== undefined) message[KEY_NAME] = fields.name;
   if (fields.model !== undefined) message[KEY_MODEL] = fields.model;
@@ -2617,7 +2619,8 @@ function selectHost(hostId, scope, offset) {
         // Only a real request gets a kind: a plan-ready row reads as "needs"
         // but has nothing to respond to, so a reply there is a plain message.
         requestKind: thread.hasPendingApprovals ? "permission" : (thread.hasPendingUserInput ? "question" : ""),
-        settled: isRestingState(state)
+        settled: isRestingState(state),
+        pinned: !!thread.pinnedAt
       };
     }), {
       scope: scope,
@@ -2677,6 +2680,18 @@ var FIXTURE_HOSTS = [
 ];
 
 var FIXTURE_ACTIVE_SESSIONS = [
+  {
+    id: "shot-host-main::thread-pinned",
+    title: "Casio LCD reference sheet",
+    detail: "idle 3d",
+    state: "idle",
+    agent: "codex",
+    summary: "Pinned so it stays in front of the user: without the pin this one is three days quiet and would have dropped into the settled list.",
+    requestId: "",
+    requestKind: "",
+    settled: false,
+    pinned: true
+  },
   {
     id: "shot-host-main::thread-approval",
     title: "Approve screenshot capture",
@@ -3139,7 +3154,10 @@ function itemFields(item, index, total) {
     requestId: item.requestId || "",
     requestKind: item.requestKind || "",
     // Lets the watch build the right action menu without a second lookup.
-    settled: item.settled ? 1 : 0
+    settled: item.settled ? 1 : 0,
+    // Pinned rows arrive first (partitionByScope), and the watch draws them as
+    // their own section, so it needs to know where that block ends.
+    pinned: item.pinned ? 1 : 0
   };
 }
 
@@ -3764,6 +3782,31 @@ function settleSession(sessionId, settled) {
   });
 }
 
+// Pin keeps a thread at the top of the active list no matter how quiet it
+// goes; unpin drops it back into ordinary order. The watch never sends an
+// orderKey: the server appends a keyless pin to the end of the pinned block,
+// which is the only placement a two-button list can express. T3's own decider
+// unsettles and unsnoozes a thread it pins, so no second command is needed to
+// pull one back out of the settled list.
+function pinSession(sessionId, pinned) {
+  dispatchForThread(sessionId, function(threadId) {
+    return {
+      type: pinned ? "thread.pin" : "thread.unpin",
+      commandId: randomId(pinned ? "pebble:pin:" : "pebble:unpin:"),
+      threadId: threadId
+    };
+  }, function(error) {
+    if (error) {
+      sendError(error);
+      return;
+    }
+    // Pinning reorders the list and can move a row between scopes, so the
+    // cached snapshot is wrong in a way a redraw cannot fix.
+    invalidateHost(sessionId);
+    send(makeMessage(CMD_PROMPT, {}));
+  });
+}
+
 function promptSession(sessionId, text) {
   var instruction = "This message was sent from the user's Pebble watch through P3. The user can open the full response, but they will mostly read the ending on the watch. End your reply with the last five sentences as a useful Pebble summary of what you did and what, if anything, you need from the user.";
   var prompt = text + "\n\n" + instruction;
@@ -4089,7 +4132,9 @@ Pebble.addEventListener("appmessage", function(event) {
     selectHost(message[KEY_HOST_ID], message[KEY_SCOPE] || 0, message[KEY_OFFSET] || 0);
   } else if (command === CMD_THREAD_ACTION) {
     var action = message[KEY_ACTION];
-    if (action === "settle" || action === "unsettle") {
+    if (action === "pin" || action === "unpin") {
+      pinSession(message[KEY_SESSION_ID], action === "pin");
+    } else if (action === "settle" || action === "unsettle") {
       settleSession(message[KEY_SESSION_ID], action === "settle");
     } else if (action === "interrupt") {
       interruptSession(message[KEY_SESSION_ID]);

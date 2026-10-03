@@ -4,6 +4,8 @@ Notable user-facing changes are recorded here.
 
 ## 0.20
 
+- Added a **PINNED** section to the thread list, with a pushpin marker on each
+  pinned row and Pin/Unpin in the thread action menu.
 - Rebranded the application and repository as **P3 — T3 Code for Pebble**.
 - Added a new P3 launcher icon and repository identity.
 - Added long-SELECT project deletion with a cancel-first menu.

@@ -45,6 +45,7 @@
 #define KEY_INSTANCE_ID  33
 #define KEY_IS_DEFAULT   34
 #define KEY_C_MONITOR    35
+#define KEY_PINNED       36
 
 #define CMD_REFRESH         1
 #define CMD_SESSION_ITEM    2
@@ -118,6 +119,14 @@
 #define GLASS_PAD 8
 #define ROW_HEIGHT 48
 #define SECTION_HEADER_HEIGHT 18
+#define PIN_MARK_W 7
+/* Pinned threads are their own block above the ordinary list, matching where
+   T3's sidebar puts them. The section exists even with nothing in it -- an
+   empty section costs no rows and no header, and holding the indices constant
+   is worth more than saving one callback branch. */
+#define SECTION_PINNED   0
+#define SECTION_THREADS  1
+#define SECTION_PROJECTS 2
 #define CARD_PAD 8
 
 /* Two rates, because two different things animate for two different reasons.
@@ -172,6 +181,7 @@ typedef struct {
   char agent[32];
   char summary[180];
   bool settled;
+  bool pinned;
 } SessionItem;
 
 typedef struct {
@@ -208,6 +218,8 @@ typedef enum {
   ActionReply = 1,
   ActionSettle,
   ActionUnsettle,
+  ActionPin,
+  ActionUnpin,
   ActionInterrupt,
   ActionCancelProject,
   ActionCreateProject,
@@ -224,6 +236,10 @@ static int s_matched;
 static int s_other;
 static FooterKind s_footers[2];
 static int s_footer_count;
+/* How many of s_sessions, from the front, are pinned. The phone sends pinned
+   threads first, so the two thread sections are one array split here rather
+   than two lists to keep in step. */
+static int s_pinned_count;
 
 /* A project path proposed by the phone, held while the user confirms it. */
 static char s_pending_project_path[160];
@@ -1751,8 +1767,20 @@ static void draw_ghost_row(GContext *ctx, GRect bounds, int row) {
   graphics_fill_rect(ctx, GRect(19, bounds.size.h / 2 + 3, width / 2, 5), 0, GCornerNone);
 }
 
-static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
-                          const char *title, const char *detail, const char *state) {
+/* A pushpin in the 7x9 the row has spare beside the title. The state mark on
+   the left already spends the row's only other glyph budget, so this is drawn
+   rather than set in a font: head, neck, stem, at the one size it is ever
+   needed. */
+static void draw_pin_mark(GContext *ctx, GPoint at) {
+  graphics_context_set_fill_color(ctx, lcd_ink());
+  graphics_fill_rect(ctx, GRect(at.x + 1, at.y, 5, 4), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(at.x, at.y + 4, 7, 1), 0, GCornerNone);
+  graphics_fill_rect(ctx, GRect(at.x + 3, at.y + 5, 1, 4), 0, GCornerNone);
+}
+
+static void draw_list_row_ex(GContext *ctx, const Layer *cell_layer, bool selected,
+                             const char *title, const char *detail, const char *state,
+                             bool pinned) {
   GRect bounds = layer_get_bounds(cell_layer);
   graphics_context_set_fill_color(ctx, lcd_glass());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
@@ -1766,9 +1794,14 @@ static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
 
   draw_state_mark(ctx, GRect(12, bounds.size.h / 2 - 9, 7, 7), state, false, true);
 
+  int title_w = bounds.size.w - 31;
+  if (pinned) {
+    draw_pin_mark(ctx, GPoint(bounds.size.w - 13, 6));
+    title_w -= PIN_MARK_W + 4;
+  }
   graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, title, font_row_title(),
-                     GRect(25, 0, bounds.size.w - 31, 21),
+                     GRect(25, 0, title_w, 21),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
   /* Pebble fonts can paint outside their nominal layout rectangle, so merely
@@ -1785,6 +1818,11 @@ static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
 
   graphics_context_set_fill_color(ctx, lcd_dim());
   graphics_fill_rect(ctx, GRect(6, bounds.size.h - 1, bounds.size.w - 12, 1), 0, GCornerNone);
+}
+
+static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
+                          const char *title, const char *detail, const char *state) {
+  draw_list_row_ex(ctx, cell_layer, selected, title, detail, state, false);
 }
 
 static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
@@ -1856,13 +1894,45 @@ static void rebuild_footers(void) {
   s_footers[s_footer_count++] = FooterScopeActive;
 }
 
-/* Rows in section 0 that are threads rather than footers. The empty list still
-   occupies one row, so the footers always sit below something. */
+static bool threads_ready(void) {
+  return s_threads_synced && !busy_is(BusyThreads);
+}
+
+/* The pinned block. Empty until a listing lands: the ghost rows that stand in
+   for a pending one all belong to the section below, so a refresh does not
+   flash a header over placeholder content. */
+static int thread_pinned_rows(void) {
+  return threads_ready() ? s_pinned_count : 0;
+}
+
+/* Rows in the main thread section that are threads rather than footers. The
+   empty list still occupies one row, so the footers always sit below
+   something -- but a host whose threads are all pinned is not empty, so that
+   placeholder is keyed off the total rather than off this section. */
 static int thread_body_rows(void) {
-  if (!s_threads_synced || busy_is(BusyThreads)) {
+  if (!threads_ready()) {
     return GHOST_ROWS;
   }
-  return s_session_count > 0 ? s_session_count : 1;
+  if (s_session_count == 0) {
+    return 1;
+  }
+  return s_session_count - s_pinned_count;
+}
+
+/* Which thread a row stands for, or -1 when the row is a footer, a ghost, or
+   the empty-list placeholder. Both thread sections index one array. */
+static int thread_row_session(MenuIndex *cell_index) {
+  if (!threads_ready() || s_session_count == 0) {
+    return -1;
+  }
+  if (cell_index->section == SECTION_PINNED) {
+    return cell_index->row < s_pinned_count ? cell_index->row : -1;
+  }
+  if (cell_index->section != SECTION_THREADS) {
+    return -1;
+  }
+  int index = s_pinned_count + cell_index->row;
+  return index < s_session_count ? index : -1;
 }
 
 static void footer_label(FooterKind kind, char *out, size_t out_size) {
@@ -1882,27 +1952,36 @@ static void footer_label(FooterKind kind, char *out, size_t out_size) {
 }
 
 static uint16_t thread_num_sections(MenuLayer *menu_layer, void *data) {
-  return 2;
+  return 3;
 }
 
 static uint16_t thread_num_rows(MenuLayer *menu_layer, uint16_t section_index, void *data) {
-  if (section_index == 1) {
+  if (section_index == SECTION_PROJECTS) {
     /* One row past the projects is the way to make a new one. */
-    return (!s_threads_synced || busy_is(BusyThreads)) ? 0 : s_project_count + 1;
+    return threads_ready() ? s_project_count + 1 : 0;
+  }
+  if (section_index == SECTION_PINNED) {
+    return thread_pinned_rows();
   }
   return thread_body_rows() + s_footer_count;
 }
 
 static int16_t thread_header_height(MenuLayer *menu_layer, uint16_t section_index, void *data) {
-  if (section_index == 1 && s_threads_synced && s_project_count > 0) {
-    return SECTION_HEADER_HEIGHT;
+  if (section_index == SECTION_PROJECTS) {
+    return (s_threads_synced && s_project_count > 0) ? SECTION_HEADER_HEIGHT : 0;
   }
-  return 0;
+  /* The two thread sections are only worth naming once the list is actually
+     split. With nothing pinned the user gets the single unlabelled run of rows
+     the list has always been. */
+  return thread_pinned_rows() > 0 ? SECTION_HEADER_HEIGHT : 0;
 }
 
 static void thread_draw_header(GContext *ctx, const Layer *cell_layer, uint16_t section_index, void *data) {
-  if (section_index != 1) {
-    return;
+  const char *label = "THREADS";
+  if (section_index == SECTION_PROJECTS) {
+    label = "START NEW";
+  } else if (section_index == SECTION_PINNED) {
+    label = "PINNED";
   }
   GRect bounds = layer_get_bounds(cell_layer);
   graphics_context_set_fill_color(ctx, lcd_glass());
@@ -1910,7 +1989,7 @@ static void thread_draw_header(GContext *ctx, const Layer *cell_layer, uint16_t 
   graphics_context_set_stroke_color(ctx, lcd_dim());
   graphics_draw_rect(ctx, GRect(4, 2, bounds.size.w - 8, bounds.size.h - 4));
   graphics_context_set_text_color(ctx, lcd_ink());
-  draw_tracked(ctx, "START NEW", font_legend(),
+  draw_tracked(ctx, label, font_legend(),
                GPoint(GLASS_PAD, ink_origin_y(bounds, font_legend())));
 }
 
@@ -1919,7 +1998,7 @@ static bool thread_list_is_empty(void) {
 }
 
 static int16_t thread_cell_height(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
-  if (thread_list_is_empty() && cell_index->section == 0) {
+  if (thread_list_is_empty() && cell_index->section == SECTION_THREADS) {
     /* One full-height cell so the glass shows a panel rather than a stray row
        floating in empty space. */
     return s_thread_menu ? layer_get_bounds(menu_layer_get_layer(s_thread_menu)).size.h : ROW_HEIGHT;
@@ -1930,7 +2009,7 @@ static int16_t thread_cell_height(MenuLayer *menu_layer, MenuIndex *cell_index, 
 static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index, void *data) {
   bool selected = menu_layer_is_index_selected(s_thread_menu, cell_index);
 
-  if (cell_index->section == 1) {
+  if (cell_index->section == SECTION_PROJECTS) {
     if (cell_index->row == s_project_count) {
       draw_list_row(ctx, cell_layer, selected, "New project", "dictate a name", "empty");
       return;
@@ -1943,10 +2022,22 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
     return;
   }
 
+  /* The pinned block holds nothing but threads: no ghosts, no footers, and no
+     empty state, because a section with no rows never asks to be drawn. */
+  if (cell_index->section == SECTION_PINNED) {
+    int pinned_index = thread_row_session(cell_index);
+    if (pinned_index >= 0) {
+      SessionItem *pinned = &s_sessions[pinned_index];
+      draw_list_row_ex(ctx, cell_layer, selected, pinned->title, pinned->detail,
+                       pinned->state, true);
+    }
+    return;
+  }
+
   /* Footer rows sit past the threads and lead elsewhere rather than opening
      one, so they are drawn before the thread cases below. */
   int body = thread_body_rows();
-  if (s_threads_synced && !busy_is(BusyThreads) && cell_index->row >= body) {
+  if (threads_ready() && cell_index->row >= body) {
     int footer = cell_index->row - body;
     if (footer < s_footer_count) {
       char label[24];
@@ -1957,7 +2048,7 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
     return;
   }
 
-  if (!s_threads_synced || busy_is(BusyThreads)) {
+  if (!threads_ready()) {
     draw_ghost_row(ctx, layer_get_bounds(cell_layer), cell_index->row);
     return;
   }
@@ -1972,17 +2063,19 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
     }
     return;
   }
-  if (cell_index->row >= s_session_count) {
+  int index = thread_row_session(cell_index);
+  if (index < 0) {
     return;
   }
-  SessionItem *item = &s_sessions[cell_index->row];
-  draw_list_row(ctx, cell_layer, selected, item->title, item->detail, item->state);
+  SessionItem *item = &s_sessions[index];
+  draw_list_row_ex(ctx, cell_layer, selected, item->title, item->detail, item->state,
+                   item->pinned);
 }
 
 /* Holding the new-project row describes a location instead of naming one: the
    concierge agent works out the path and it comes back to the same confirm. */
 static void thread_select_long(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
-  if (cell_index->section != 1 || !s_threads_synced || busy_is(BusyThreads) ||
+  if (cell_index->section != SECTION_PROJECTS || !threads_ready() ||
       cell_index->row > s_project_count) {
     return;
   }
@@ -1997,7 +2090,7 @@ static void thread_select_long(MenuLayer *menu_layer, MenuIndex *cell_index, voi
 }
 
 static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *data) {
-  if (cell_index->section == 1) {
+  if (cell_index->section == SECTION_PROJECTS) {
     if (busy_is(BusyModels)) {
       return;
     }
@@ -2017,7 +2110,7 @@ static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *da
   }
 
   int body = thread_body_rows();
-  if (s_threads_synced && !busy_is(BusyThreads) && cell_index->row >= body) {
+  if (cell_index->section == SECTION_THREADS && threads_ready() && cell_index->row >= body) {
     int footer = cell_index->row - body;
     if (footer >= s_footer_count) {
       return;
@@ -2036,10 +2129,11 @@ static void thread_select(MenuLayer *menu_layer, MenuIndex *cell_index, void *da
     return;
   }
 
-  if (!s_threads_synced || s_session_count == 0 || cell_index->row >= s_session_count) {
+  int index = thread_row_session(cell_index);
+  if (index < 0) {
     return;
   }
-  s_selected_index = cell_index->row;
+  s_selected_index = index;
   s_showing_context = false;
   busy_clear(BusyContext);
   s_pending_context_session_id[0] = '\0';
@@ -2255,6 +2349,14 @@ static void perform_action(ActionMenu *menu, const ActionMenuItem *action, void 
       set_status("Reopening");
       send_thread_action("unsettle");
       return;
+    case ActionPin:
+      set_status("Pinning");
+      send_thread_action("pin");
+      return;
+    case ActionUnpin:
+      set_status("Unpinning");
+      send_thread_action("unpin");
+      return;
     case ActionInterrupt:
       set_status("Interrupting");
       send_thread_action("interrupt");
@@ -2299,7 +2401,7 @@ static void open_thread_actions(void) {
   if (s_selected_index < 0 || s_selected_index >= s_session_count) {
     return;
   }
-  ActionMenuLevel *level = action_menu_level_create(3);
+  ActionMenuLevel *level = action_menu_level_create(4);
   if (!level) {
     log_error("Out of memory");
     return;
@@ -2310,6 +2412,13 @@ static void open_thread_actions(void) {
   } else {
     action_menu_level_add_action(level, "Settle", perform_action, (void *)(uintptr_t)ActionSettle);
     action_menu_level_add_action(level, "Interrupt", perform_action, (void *)(uintptr_t)ActionInterrupt);
+  }
+  /* Offered on a settled thread too: the server's decider unsettles whatever
+     it pins, so this is also the one-press way back out of that list. */
+  if (s_sessions[s_selected_index].pinned) {
+    action_menu_level_add_action(level, "Unpin", perform_action, (void *)(uintptr_t)ActionUnpin);
+  } else {
+    action_menu_level_add_action(level, "Pin", perform_action, (void *)(uintptr_t)ActionPin);
   }
   open_action_menu(level);
 }
@@ -2845,6 +2954,7 @@ static void reset_hosts(void) {
 static void reset_sessions(void) {
   memset(s_sessions, 0, sizeof(s_sessions));
   s_session_count = 0;
+  s_pinned_count = 0;
 }
 
 static void reset_projects(void) {
@@ -2914,7 +3024,7 @@ static void show_screenshot_page(int page) {
      can be documented independently of the thread rows above them. */
   if (page == 7) {
     if (s_thread_menu && s_project_count > 0) {
-      menu_layer_set_selected_index(s_thread_menu, MenuIndex(1, 0), MenuRowAlignCenter, false);
+      menu_layer_set_selected_index(s_thread_menu, MenuIndex(SECTION_PROJECTS, 0), MenuRowAlignCenter, false);
     }
     mark_all_dirty();
     return;
@@ -3020,6 +3130,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       copy_tuple(item->request_id, sizeof(item->request_id), iter, KEY_REQUEST_ID);
       copy_tuple(item->request_kind, sizeof(item->request_kind), iter, KEY_REQUEST_KIND);
       item->settled = int_tuple(iter, KEY_SETTLED, 0) != 0;
+      item->pinned = int_tuple(iter, KEY_PINNED, 0) != 0;
       if (index + 1 > s_session_count) {
         s_session_count = index + 1;
       }
@@ -3033,6 +3144,13 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
     s_offset = int_tuple(iter, KEY_OFFSET, s_offset);
     s_matched = int_tuple(iter, KEY_MATCHED, s_session_count);
     s_other = int_tuple(iter, KEY_OTHER, 0);
+    /* Only the leading run counts. A phone that ever sent an out-of-order pin
+       would put it in the ordinary section with its marker still drawn, rather
+       than mislabelling the rows between. */
+    s_pinned_count = 0;
+    while (s_pinned_count < s_session_count && s_sessions[s_pinned_count].pinned) {
+      s_pinned_count++;
+    }
     busy_clear(BusyThreads);
     s_threads_synced = true;
     rebuild_footers();
