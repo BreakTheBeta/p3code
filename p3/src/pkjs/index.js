@@ -48,6 +48,8 @@ var KEY_INSTANCE_ID = "instance_id";
 var KEY_IS_DEFAULT = "is_default";
 var KEY_C_MONITOR = "c_monitor";
 var KEY_PINNED = "pinned";
+var KEY_C_ERROR = "c_error";
+var KEY_THREAD_META = "thread_meta";
 
 var CMD_REFRESH = 1;
 var CMD_SESSION_ITEM = 2;
@@ -77,11 +79,11 @@ var CMD_SCREENSHOT_PAGE = 90;
 var SCOPE_ACTIVE = 0;
 var SCOPE_SETTLED = 1;
 
-var BUILD_LABEL = "v0.20";
+var BUILD_LABEL = "v0.27";
 // @generated protocol:end
 
 var MAX_SESSIONS = 20;
-var SUMMARY_LIMIT = 150;
+var SUMMARY_LIMIT = 320;
 var CONTEXT_LIMIT = 480;
 var CONTEXT_MESSAGE_LIMIT = 60;
 var DETAIL_MESSAGE_LIMIT = 10;
@@ -1246,7 +1248,12 @@ function normalizeV2Thread(thread) {
   // neither is an approval.
   normalized.hasPendingUserInput = kind === "user_input";
   normalized.hasPendingApprovals = !!request && kind !== "user_input" && kind !== "auth_refresh";
-  normalized.backgroundLiveness = tasks && tasks.length ? "monitoring" : null;
+  normalized.waitingOnThread = thread.blockedOnThreadWait === true && thread.activityRunStatus === "running";
+  // Fold only treats commands and monitors as a wait when the agent awaits them.
+  var waitingOnBackground = (tasks || []).some(function(task) {
+    return task.awaited === true || (task.kind !== "command" && task.kind !== "monitor");
+  });
+  normalized.backgroundLiveness = waitingOnBackground ? "monitoring" : null;
   return normalized;
 }
 
@@ -1312,37 +1319,71 @@ function normalizeV2Projection(server, projection) {
   detail.messages = projection.messages || [];
   detail.checkpoints = [];
   detail.proposedPlans = [];
-  detail.activities = v2RequestActivities(projection.runtimeRequests);
-  if (server) {
+  detail.activities = v2RequestActivities(projection.runtimeRequests, projection.turnItems);
+  // The detail projection can omit the shell's live run and request fields.
+  // Keep those ids when the user opens a thread before interrupting it.
+  if (server && (thread.activeRunId !== undefined || thread.latestRunId !== undefined ||
+                 thread.pendingRuntimeRequest !== undefined)) {
     var runtime = v2RuntimeByServer[server.id] || (v2RuntimeByServer[server.id] = {});
-    runtime[thread.id] = {
-      runId: thread.activeRunId || thread.latestRunId || null,
-      requestId: (thread.pendingRuntimeRequest && thread.pendingRuntimeRequest.id) || null
-    };
+    var entry = runtime[thread.id] || (runtime[thread.id] = {});
+    if (thread.activeRunId !== undefined || thread.latestRunId !== undefined) {
+      entry.runId = thread.activeRunId || thread.latestRunId || null;
+    }
+    if (thread.pendingRuntimeRequest !== undefined) {
+      entry.requestId = (thread.pendingRuntimeRequest && thread.pendingRuntimeRequest.id) || null;
+    }
   }
   return detail;
 }
 
-/* The detail screen re-derives approvals from the activity log rather than the
-   rolled-up flags, so that a request which landed since the last poll still
-   reads as needing an answer. Protocol 2 has no log -- it reports the requests
-   themselves, with a status -- so the two events the derivation looks for are
-   synthesized from it. The kinds line up already: T3's ProviderRequestKind is
-   the same command / file-read / file-change vocabulary the watch speaks. */
-function v2RequestActivities(requests) {
+/* Fold projects request status and question text separately. Join them by
+   request id before passing them to the shared detail and reply paths. */
+function v2RequestActivities(requests, turnItems) {
   var activities = [];
+  var questionsByRequest = Object.create(null);
+  var approvalDetails = Object.create(null);
+  (turnItems || []).forEach(function(item) {
+    if (item.type === "user_input_request" && Array.isArray(item.questions) && item.questions.length) {
+      questionsByRequest[item.requestId] = item.questions;
+    } else if (item.type === "approval_request") {
+      approvalDetails[item.requestId] = [item.prompt, item.reason].filter(Boolean).join("\n");
+    }
+  });
   requests = requests || [];
   for (var i = 0; i < requests.length; i++) {
     var request = requests[i];
-    // user_input carries no question text here, so it cannot be rebuilt into a
-    // prompt the watch could answer; auth_refresh is not the user's to approve.
-    if (!request || !request.id || request.kind === "user_input" || request.kind === "auth_refresh") {
+    if (!request || !request.id || request.kind === "auth_refresh") {
+      continue;
+    }
+    if (request.kind === "user_input") {
+      var questions = questionsByRequest[request.id];
+      if (request.status === "pending" && questions) {
+        activities.push({
+          kind: "user-input.requested",
+          createdAt: request.createdAt || "",
+          payload: {
+            requestId: request.id,
+            questions: questions.map(function(question) {
+              return {
+                id: question.id,
+                header: question.header,
+                question: question.question,
+                multiple: question.multiSelect,
+                custom: question.allowCustomAnswer,
+                options: question.options.map(function(option) {
+                  return { label: option.label, answerValue: option.value };
+                })
+              };
+            })
+          }
+        });
+      }
       continue;
     }
     activities.push({
       kind: request.status === "pending" ? "approval.requested" : "approval.resolved",
       createdAt: request.createdAt || "",
-      payload: { requestId: request.id, requestKind: request.kind, detail: "" }
+      payload: { requestId: request.id, requestKind: request.kind, detail: approvalDetails[request.id] || "" }
     });
   }
   return activities;
@@ -1624,12 +1665,14 @@ function makeMessage(command, fields) {
   if (fields.model !== undefined) message[KEY_MODEL] = fields.model;
   if (fields.instanceId !== undefined) message[KEY_INSTANCE_ID] = fields.instanceId;
   if (fields.isDefault !== undefined) message[KEY_IS_DEFAULT] = fields.isDefault;
+  if (fields.threadMeta !== undefined) message[KEY_THREAD_META] = fields.threadMeta;
   if (fields.counts !== undefined) {
     message[KEY_C_NEEDS] = fields.counts.needs;
     message[KEY_C_RUN] = fields.counts.run;
     message[KEY_C_IDLE] = fields.counts.idle;
     message[KEY_C_SETTLED] = fields.counts.settled;
     message[KEY_C_MONITOR] = fields.counts.monitor || 0;
+    message[KEY_C_ERROR] = fields.counts.error || 0;
   }
   return message;
 }
@@ -1881,6 +1924,9 @@ function threadState(thread, nowMs) {
   if (hasPending) {
     return "needs";
   }
+  if (thread.waitingOnThread) {
+    return "monitor";
+  }
   if (status === "starting" || status === "running" || queuedTurnStart) {
     return "run";
   }
@@ -1947,7 +1993,7 @@ function threadDetailLine(thread, state, nowMs, waitingSince) {
     return "running";
   }
   if (state === "monitor") {
-    return "monitoring";
+    return thread.waitingOnThread ? "waiting on a thread" : "monitoring";
   }
   if (state === "err") {
     return "error";
@@ -2308,7 +2354,9 @@ function parseUserInputQuestions(payload) {
       id: question.id,
       header: question.header || "",
       question: question.question,
-      options: question.options
+      options: question.options,
+      multiple: question.multiple,
+      custom: question.custom
     });
   }
   return parsed.length ? parsed : null;
@@ -2492,8 +2540,6 @@ function refreshHosts(afterCurrent) {
       }
       enrichShellChangeRequests(server, snapshot, function(enriched) {
         var entry = cacheShell(server, enriched);
-        // Avoid allocating a filtered copy solely for a one-pass roll-up.
-        // rollupForThreads skips archived/deleted rows itself.
         var threads = entry.raw && entry.raw.threads ? entry.raw.threads : [];
         var counts = rollupForThreads(threads, nowMs);
         var state = hostStateFromCounts(counts);
@@ -2506,7 +2552,8 @@ function refreshHosts(afterCurrent) {
             needs: counts.needs,
             run: counts.run,
             monitor: counts.monitor,
-            idle: counts.idle + counts.err,
+            idle: counts.idle,
+            error: counts.err,
             settled: counts.settled + counts.snooze
           }
         };
@@ -2607,14 +2654,22 @@ function selectHost(hostId, scope, offset) {
       offset = 0;
     }
     var page = matched.slice(offset, offset + MAX_SESSIONS);
+    var projectsById = Object.create(null);
+    (tagged.projects || []).forEach(function(project) {
+      projectsById[project.id] = projectTitle(project);
+    });
     sendSessionItems(page.map(function(thread) {
       var state = split.stateById[thread.id];
+      var latest = thread.latestVisibleMessage;
+      var preview = state === "err" ? latestErrorDetail(thread) : (latest && latest.text);
+      preview = String(preview || "").replace(/\s+/g, " ").trim();
       return {
         id: thread.id,
         title: compact(thread.title || "Untitled", 54),
         detail: threadDetailLine(thread, state, nowMs),
         state: state,
-        summary: "",
+        summary: trimToUtf8BytesWithIndex(preview, 120).text,
+        threadMeta: trimToUtf8BytesWithIndex(projectsById[thread.projectId], 50).text,
         requestId: "",
         // Only a real request gets a kind: a plan-ready row reads as "needs"
         // but has nothing to respond to, so a reply there is a plain message.
@@ -2656,9 +2711,9 @@ var FIXTURE_HOSTS = [
   {
     id: "shot-host-main",
     title: "WORKBENCH",
-    detail: "2 need you",
+    detail: "1 need you",
     state: "needs",
-    counts: { needs: 2, run: 1, monitor: 2, idle: 3, settled: 8 }
+    counts: { needs: 1, error: 1, run: 1, monitor: 2, idle: 3, settled: 8 }
   },
   {
     id: "shot-host-lab",
@@ -2683,6 +2738,7 @@ var FIXTURE_ACTIVE_SESSIONS = [
   {
     id: "shot-host-main::thread-pinned",
     title: "Casio LCD reference sheet",
+    threadMeta: "P3",
     detail: "idle 3d",
     state: "idle",
     agent: "codex",
@@ -2800,7 +2856,9 @@ function fixtureDetail(sessionId, index) {
     sendError("No fixture thread");
     return;
   }
-  send(makeMessage(CMD_DETAIL, itemFields(item, index || 0, 1)));
+  var fields = itemFields(item, index || 0, 1);
+  fields.threadMeta = "Project: P3\nBranch: matrix-dashboard\nPR #42 open\nModel: gpt-5.6-sol";
+  send(makeMessage(CMD_DETAIL, fields));
 }
 
 function fixtureContext(sessionId, index, page, requestId) {
@@ -3022,7 +3080,7 @@ function pendingSummary(pending) {
     var resources = (request.resources || request.patterns || request.always || []).join(", ");
     var action = request.action || request.permission || "permission";
     var tool = request.tool && request.tool.callID ? " for tool " + request.tool.callID : "";
-    return compact("Needs permission: " + action + tool + (resources ? " on " + resources : "") + ".", SUMMARY_LIMIT);
+    return "Needs permission: " + action + tool + (resources ? " on " + resources + "." : ".");
   }
 
   var questions = request.questions || [];
@@ -3030,13 +3088,13 @@ function pendingSummary(pending) {
     return "Needs an answer.";
   }
 
-  var first = questions[0];
-  var options = (first.options || []).map(function(option) {
-    return option.label;
-  }).join(", ");
-  var prefix = questions.length > 1 ? questions.length + " questions. First: " : "Question: ";
-  var suffix = options ? " Options: " + options + "." : "";
-  return compact(prefix + first.question + suffix, SUMMARY_LIMIT);
+  return questions.map(function(question, index) {
+    var options = (question.options || []).map(function(option) {
+      return option.label;
+    }).join(", ");
+    var prefix = questions.length > 1 ? (index + 1) + ". " : "Question: ";
+    return prefix + question.question + (options ? "\nOptions: " + options : "");
+  }).join("\n\n");
 }
 
 
@@ -3150,7 +3208,8 @@ function itemFields(item, index, total) {
     detail: item.detail,
     state: item.state,
     agent: item.agent || "",
-    summary: item.summary || "",
+    summary: trimToUtf8BytesWithIndex(item.summary || "", SUMMARY_LIMIT).text,
+    threadMeta: item.threadMeta || "",
     requestId: item.requestId || "",
     requestKind: item.requestKind || "",
     // Lets the watch build the right action menu without a second lookup.
@@ -3178,12 +3237,15 @@ function detail(sessionId, index) {
         sendError(error);
         return;
       }
-      sendThreadDetail(sessionId, index, lifecycle || thread, thread);
+      var project = shell && (shell.projects || []).find(function(entry) {
+        return entry.id === thread.projectId;
+      });
+      sendThreadDetail(sessionId, index, lifecycle || thread, thread, project);
     });
   });
 }
 
-function sendThreadDetail(sessionId, index, lifecycle, thread) {
+function sendThreadDetail(sessionId, index, lifecycle, thread, project) {
   {
     var nowMs = Date.now();
     // Both walks want the same list in the same order, and each used to sort
@@ -3203,7 +3265,7 @@ function sendThreadDetail(sessionId, index, lifecycle, thread) {
     } else if (input) {
       summary = pendingSummary({ kind: "question", request: input });
     } else if (state === "err") {
-      summary = compact("Error: " + (latestErrorDetail(thread) || "unknown"), SUMMARY_LIMIT);
+      summary = compact("Error: " + (latestErrorDetail(thread) || latestErrorDetail(lifecycle) || "unknown"), SUMMARY_LIMIT);
     } else {
       summary = summaryFromMessages((thread.messages || []).map(toPebbleMessage));
     }
@@ -3219,6 +3281,14 @@ function sendThreadDetail(sessionId, index, lifecycle, thread) {
     }
 
     var waitingSince = approval ? approval.createdAt : (input ? input.createdAt : null);
+    var metadata = [];
+    if (project) metadata.push("Project: " + projectTitle(project));
+    if (thread.branch) metadata.push("Branch: " + thread.branch);
+    var pr = thread.linkedPullRequest || thread.branchPullRequest;
+    var prState = lifecycle.changeRequestState;
+    if (pr || prState) metadata.push("PR" + (pr ? " #" + pr.number : "") + (prState ? " " + prState : ""));
+    var model = (thread.modelSelection || lifecycle.modelSelection || {}).model;
+    if (model) metadata.push("Model: " + model);
     var item = {
       id: sessionId,
       title: compact(thread.title || "Untitled", 54),
@@ -3226,6 +3296,7 @@ function sendThreadDetail(sessionId, index, lifecycle, thread) {
       detail: threadDetailLine(lifecycle, state, nowMs, waitingSince),
       state: state,
       summary: summary,
+      threadMeta: trimToUtf8BytesWithIndex(metadata.join("\n"), 160).text,
       requestId: approval ? approval.requestId : (input ? input.requestId : ""),
       requestKind: approval ? "permission" : (input ? "question" : "")
     };
@@ -3488,7 +3559,7 @@ function buildSingleQuestionAnswer(question, text) {
   }
 
   var label = matchSingleOption(options, text);
-  if (label) {
+  if (label !== null) {
     return [label];
   }
   return question.custom === false ? null : [text];
@@ -3500,7 +3571,7 @@ function matchSingleOption(options, text) {
     var label = options[i].label || "";
     var option = normalize(label);
     if (normalized === option || normalized.indexOf(option) === 0 || option.indexOf(normalized) === 0) {
-      return label;
+      return typeof options[i].answerValue === "string" ? options[i].answerValue : label;
     }
   }
   return null;
@@ -3513,7 +3584,7 @@ function matchMultipleOptions(options, text) {
     var label = options[i].label || "";
     var option = normalize(label);
     if (normalized === option || normalized.indexOf(option) !== -1) {
-      labels.push(label);
+      labels.push(typeof options[i].answerValue === "string" ? options[i].answerValue : label);
     }
   }
   return labels;

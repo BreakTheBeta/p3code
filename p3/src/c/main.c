@@ -46,6 +46,8 @@
 #define KEY_IS_DEFAULT   34
 #define KEY_C_MONITOR    35
 #define KEY_PINNED       36
+#define KEY_C_ERROR      37
+#define KEY_THREAD_META  43
 
 #define CMD_REFRESH         1
 #define CMD_SESSION_ITEM    2
@@ -75,7 +77,7 @@
 #define SCOPE_ACTIVE  0
 #define SCOPE_SETTLED 1
 
-#define BUILD_LABEL "v0.20"
+#define BUILD_LABEL "v0.27"
 /* @generated protocol:end */
 
 #define MAX_HOSTS 6
@@ -117,7 +119,8 @@
 #define PANEL_W (SCREEN_W - 2 * PANEL_INSET)
 #define PANEL_H (SCREEN_H - TOP_CHROME - BOTTOM_CHROME)
 #define GLASS_PAD 8
-#define ROW_HEIGHT 48
+#define ROW_HEIGHT 40
+#define PREVIEW_ROW_HEIGHT 65
 #define SECTION_HEADER_HEIGHT 18
 #define PIN_MARK_W 7
 /* Pinned threads are their own block above the ordinary list, matching where
@@ -165,6 +168,7 @@ typedef struct {
   char detail[96];
   char state[10];
   int needs;
+  int errors;
   int run;
   int monitor;
   int idle;
@@ -179,7 +183,10 @@ typedef struct {
   char request_id[72];
   char request_kind[12];
   char agent[32];
-  char summary[180];
+  char summary[321];
+  char thread_meta[161];
+  char project_name[51];
+  bool has_list_preview;
   bool settled;
   bool pinned;
 } SessionItem;
@@ -263,33 +270,9 @@ static ScrollLayer *s_scroll_layer;
 static AppTimer *s_refresh_timer;
 static AppTimer *s_stream_timer;
 static DictationSession *s_dictation;
-static GFont s_font_dseg_big;
-static GFont s_font_dseg_mid;
 static GFont s_font_dot;
 static GFont s_font_dot_small;
-static GBitmap *s_hatch;
-static GColor s_hatch_palette[2];
 static DictationTarget s_dictation_target = DictationTargetSession;
-
-/* Segment-block metrics, measured once at launch. These are constant for a
-   given font, and laying them out again inside every frame was the single
-   most expensive thing the host screen did -- graphics_text_layout_get_content_size
-   is a full layout pass, and draw_seg_value ran two of them per readout. */
-/* Two segment faces, both at sizes where DSEG7 rasterises on whole pixels.
-   The face is an outline, so it is only pixel-exact where its stems land on
-   the grid: at 34 and 64 every digit has one stem weight and no ink in a
-   one-pixel run, while the 20px face this replaced put 12.5% of its ink in
-   slivers and mixed 2px and 8px stems in the same glyph. tools/verify_dseg.py
-   is the check; change a size and run it before believing the result. */
-typedef enum {
-  SegMid = 0,   /* 34px: the sub-display readouts */
-  SegBig,       /* 64px: the power-on segment test */
-  SegSizeCount
-} SegSize;
-
-static GSize s_seg_block[SegSizeCount];  /* "88" in each DSEG face */
-static int s_seg_digit[SegSizeCount];    /* one digit's advance, per face */
-static GSize s_seg_self_test;  /* "88", the connecting screen's all-segments test */
 
 static HostItem s_hosts[MAX_HOSTS];
 static SessionItem s_sessions[MAX_SESSIONS];
@@ -310,6 +293,7 @@ static int s_context_page_count = 1;
 static int s_pending_context_page;
 static int s_context_request_counter;
 static int s_stream_phase;
+static uint32_t s_busy_started_ms;
 static int s_connect_draw_second = -1;
 
 static int s_busy;
@@ -415,24 +399,13 @@ static void log_error(const char *text) {
 
 /* ---------------------------------------------------------------- palette */
 
-/* A negative-LCD Casio: near-black chassis, pale glass, dark ink, cyan
-   legends, crimson rails. Monochrome watches collapse to black on white,
-   which the shape language survives. */
-/* A real positive LCD is a warm tan, not neutral grey; pale grey washes out
-   on the physical panel. This is the substrate the reference photographs as. */
 static GColor lcd_glass(void) {
-#ifdef PBL_COLOR
-  return GColorBrass;
-#else
   return GColorWhite;
-#endif
 }
 
-/* Unlit segments sit between the substrate and the ink, then get knocked back
-   further by the hatch. */
 static GColor lcd_ghost_tone(void) {
 #ifdef PBL_COLOR
-  return GColorPastelYellow;
+  return GColorLightGray;
 #else
   return GColorBlack;
 #endif
@@ -455,18 +428,13 @@ static GColor chassis(void) {
 }
 
 static GColor legend(void) {
-#ifdef PBL_COLOR
-  return GColorPictonBlue;
-#else
   return GColorWhite;
-#endif
 }
 
-/* Red on the black chassis has to be bright to read; the same red on the pale
-   glass has to be dark. One value cannot do both jobs. */
+/* The amber accent marks activity and faults on the black chassis. */
 static GColor rule_color(void) {
 #ifdef PBL_COLOR
-  return GColorFolly;
+  return GColorRajah;
 #else
   return GColorWhite;
 #endif
@@ -521,7 +489,7 @@ static GColor monitoring_color(void) {
    All 95 printable ASCII glyphs are verified bit-identical to the source
    bitmap at both scales. Each size must be requested at the size it was built
    for, or the doubling breaks and the strokes go ragged. */
-static GFont font_row_title(void) {
+static GFont font_display_title(void) {
   return s_font_dot ? s_font_dot : fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
 }
 
@@ -538,10 +506,12 @@ static GFont font_legend(void) {
   return s_font_dot_small ? s_font_dot_small : fonts_get_system_font(FONT_KEY_GOTHIC_14_BOLD);
 }
 
-/* The one deliberate exception to the dot-matrix theme. Reading a full agent
-   message is the task where legibility beats styling, and the system face is
-   hand-hinted and proportional, so it fits far more words per line. Chrome,
-   titles, labels and readouts stay LCD; only the message body is Gothic. */
+/* Proportional Gothic keeps thread names and agent responses legible at
+   watch scale. The dashboard and its small labels retain their bitmap face. */
+static GFont font_thread_title(void) {
+  return fonts_get_system_font(FONT_KEY_GOTHIC_18_BOLD);
+}
+
 static GFont font_body(void) {
   return fonts_get_system_font(FONT_KEY_GOTHIC_18);
 }
@@ -666,7 +636,7 @@ static bool any_live_session(void) {
    animates nothing at all and registers no timer: a machine working somewhere
    else is a fact, not an event, and a static mark says it just as well as a
    pulsing one. The thread list is a surface you are actively looking at rather
-   than one you park on, so a running row there still breathes.
+   than one you park on, so a running row there cycles its four status pixels.
 
    Anything with a request in flight animates on either screen, because that is
    feedback rather than decoration, and it is over in seconds. */
@@ -754,9 +724,19 @@ static void update_stream_timer(void) {
   s_stream_timer = app_timer_register(interval, stream_timer_callback, NULL);
 }
 
+static uint32_t animation_clock_ms(void) {
+  time_t seconds;
+  uint16_t milliseconds;
+  time_ms(&seconds, &milliseconds);
+  return (uint32_t)seconds * 1000u + milliseconds;
+}
+
 /* Both go through update_host_rail: the sweep strip is shown exactly while
    something is in flight, and hidden the rest of the time. */
 static void busy_set(int flags) {
+  if (s_busy == 0) {
+    s_busy_started_ms = animation_clock_ms();
+  }
   s_busy |= flags;
   update_host_rail();
   update_stream_timer();
@@ -842,59 +822,6 @@ static void draw_text_v(GContext *ctx, const char *text, GFont font, GRect box,
 }
 
 
-/* One 1-bit tile does the LCD texture work, blitted rather than drawn pixel by
-   pixel: a hatch that knocks unlit segments back so they read as texture
-   instead of competing with the lit ones. Built once at launch.
-
-   A second tile stippled the whole substrate for panel grain. It competed with
-   every glyph and read as dirt, so it was cut -- the reference substrate is
-   smooth and gets its LCD character from the unlit segments instead. */
-static void lcd_tiles_create(void) {
-  s_hatch_palette[0] = GColorClear;
-  s_hatch_palette[1] = lcd_glass();
-  s_hatch = gbitmap_create_blank_with_palette(GSize(8, 8), GBitmapFormat1BitPalette,
-                                              s_hatch_palette, false);
-  if (s_hatch) {
-    uint8_t *data = gbitmap_get_data(s_hatch);
-    uint16_t stride = gbitmap_get_bytes_per_row(s_hatch);
-    for (int y = 0; y < 8; y++) {
-      /* 75% coverage: one ghost pixel in four survives. */
-      data[y * stride] = (y % 2 == 0) ? 0xAA : 0xFF;
-    }
-  }
-
-}
-
-static void lcd_tiles_destroy(void) {
-  if (s_hatch) {
-    gbitmap_destroy(s_hatch);
-    s_hatch = NULL;
-  }
-}
-
-static void hatch_rect(GContext *ctx, GRect r) {
-  if (!s_hatch) {
-    return;
-  }
-  graphics_context_set_compositing_mode(ctx, GCompOpSet);
-  graphics_draw_bitmap_in_rect(ctx, s_hatch, r);
-}
-
-/* The glass sits below the chassis face, so it carries a shadow along the top
-   and left inside edges and catches light along the bottom and right. */
-static void draw_panel_bevel(GContext *ctx, GRect panel) {
-  graphics_context_set_stroke_color(ctx, lcd_dim());
-  graphics_draw_line(ctx, GPoint(panel.origin.x + 2, panel.origin.y + 1),
-                     GPoint(panel.origin.x + panel.size.w - 3, panel.origin.y + 1));
-  graphics_draw_line(ctx, GPoint(panel.origin.x + 1, panel.origin.y + 2),
-                     GPoint(panel.origin.x + 1, panel.origin.y + panel.size.h - 3));
-  graphics_context_set_stroke_color(ctx, GColorWhite);
-  graphics_draw_line(ctx, GPoint(panel.origin.x + 2, panel.origin.y + panel.size.h - 2),
-                     GPoint(panel.origin.x + panel.size.w - 3, panel.origin.y + panel.size.h - 2));
-  graphics_draw_line(ctx, GPoint(panel.origin.x + panel.size.w - 2, panel.origin.y + 2),
-                     GPoint(panel.origin.x + panel.size.w - 2, panel.origin.y + panel.size.h - 3));
-}
-
 /* Labels are drawn as whole strings.
 
    These used to render glyph by glyph to fake letter-spacing, stepping by each
@@ -920,117 +847,81 @@ static void draw_tracked(GContext *ctx, const char *text, GFont font, GPoint ori
   draw_tracked_max(ctx, text, font, origin, 0);
 }
 
-/* The crimson rails bracket the glass and taper toward the buttons, the way
-   the reference marks LIGHT / UP ENTER / DOWN. */
-static void draw_rail(GContext *ctx, GRect bounds, int y, bool point_up) {
-  graphics_context_set_fill_color(ctx, rule_color());
-  graphics_fill_rect(ctx, GRect(7, y, bounds.size.w - 14, RAIL_HEIGHT), 0, GCornerNone);
-  for (int i = 0; i < 4; i++) {
-    int dy = point_up ? -i : i;
-    graphics_fill_rect(ctx, GRect(7 - i - 1, y + dy, 1, RAIL_HEIGHT), 0, GCornerNone);
-    graphics_fill_rect(ctx, GRect(bounds.size.w - 7 + i, y + dy, 1, RAIL_HEIGHT), 0, GCornerNone);
+static void draw_dot_rule(GContext *ctx, int x, int y, int width, GColor color) {
+  graphics_context_set_fill_color(ctx, color);
+  for (int column = 0; column < width; column += 4) {
+    graphics_fill_rect(ctx, GRect(x + column, y, 2, 1), 0, GCornerNone);
   }
 }
 
-/* Segment digits come from DSEG7, drawn the way a real panel works: the full
-   "88" is laid down in the ghost tone first, the hatch knocks it back, then
-   the live value goes on top. Nothing shifts when a digit is blank, because
-   DSEG is fixed-width and the unlit segments stay put.
-
-   Every segment draw asks for GTextOverflowModeFill rather than the trailing
-   ellipsis used everywhere else. DSEG7 is subset to "[0-9:]", so it carries no
-   U+2026, and asking the layout for an ellipsis in a font that has none hangs
-   the firmware outright -- it never returns and the watch stops answering the
-   protocol. Fill is also what these readouts want: each one is a fixed-width
-   value drawn into a box measured from itself, so it can never overflow. */
-static GSize seg_text_size(const char *text, GFont font) {
-  return graphics_text_layout_get_content_size(text, font, GRect(0, 0, 160, 80),
-                                               GTextOverflowModeFill,
-                                               GTextAlignmentLeft);
+static void draw_rail(GContext *ctx, GRect bounds, int y) {
+  draw_dot_rule(ctx, 7, y, bounds.size.w - 14, legend());
 }
 
-/* Every readout on the glass is two digits against an "88" ghost, and DSEG is
-   fixed-pitch, so both metrics are constants. They used to be laid out inside
-   the draw call -- two full text-layout passes per readout, four readouts on
-   the host screen, on every frame of a 9 Hz loop. Measured once at launch
-   instead; a digit's advance is all that is needed to right-align the value. */
-static GFont seg_font(SegSize size) {
-  return size == SegBig ? s_font_dseg_big : s_font_dseg_mid;
-}
+/* Five-column glyphs for the numeric readouts. */
+static void draw_matrix_number(GContext *ctx, GPoint at, int value, int columns, int pitch,
+                               bool leading_zero, GColor ink) {
+  static const uint8_t digits[10][7] = {
+    { 14, 17, 19, 21, 25, 17, 14 },
+    { 4, 12, 4, 4, 4, 4, 14 },
+    { 14, 17, 1, 6, 8, 16, 31 },
+    { 30, 1, 1, 14, 1, 1, 30 },
+    { 2, 6, 10, 18, 31, 2, 2 },
+    { 31, 16, 16, 30, 1, 1, 30 },
+    { 6, 8, 16, 30, 17, 17, 14 },
+    { 31, 1, 2, 4, 8, 8, 8 },
+    { 14, 17, 17, 14, 17, 17, 14 },
+    { 14, 17, 17, 15, 1, 2, 12 },
+  };
 
-static void lcd_metrics_measure(void) {
-  GFont mid = seg_font(SegMid), big = seg_font(SegBig);
-  s_seg_block[SegMid] = mid ? seg_text_size("88", mid) : GSize(56, 34);
-  s_seg_block[SegBig] = big ? seg_text_size("88", big) : GSize(104, 64);
-  s_seg_digit[SegMid] = mid ? seg_text_size("8", mid).w : s_seg_block[SegMid].w / 2;
-  s_seg_digit[SegBig] = big ? seg_text_size("8", big).w : s_seg_block[SegBig].w / 2;
-  s_seg_self_test = big ? seg_text_size("88", big) : GSize(104, 64);
-}
-
-static GSize seg_block_size(SegSize size) {
-  return s_seg_block[size];
-}
-
-/* The ghost is what makes it read as a panel rather than as text: a real LCD
-   shows its unlit segments, so every readout is drawn as "88" in the ghost
-   tone with the live value lit on top of it. `ghost` is a parameter because an
-   inverted band runs the same readout on ink instead of on glass, where the
-   pale ghost would be the brightest thing on the screen. */
-static void draw_seg_value_ex(GContext *ctx, GPoint at, int value, GColor on, SegSize size,
-                              GColor ghost, bool hatched) {
-  GFont font = seg_font(size);
-  char live[8];
-  snprintf(live, sizeof(live), "%d", value);
-
-  if (!font) {
-    /* A resource that failed to load must not leave a hole where the reading
-       goes: fall back to the label face rather than drawing nothing. */
-    graphics_context_set_text_color(ctx, on);
-    graphics_draw_text(ctx, live, size == SegBig ? font_row_title() : font_row_detail(),
-                       GRect(at.x, at.y, 44, size == SegBig ? 30 : 18),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-    return;
-  }
-
-  GSize full = seg_block_size(size);
-  int live_w = (int)strlen(live) * s_seg_digit[size];
-
-  graphics_context_set_text_color(ctx, ghost);
-  graphics_draw_text(ctx, "88", font, GRect(at.x, at.y, full.w + 4, full.h + 4),
-                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-  if (hatched) {
-    hatch_rect(ctx, GRect(at.x, at.y, full.w + 2, full.h + 2));
-  }
-
-  /* Right-aligned into the ghost so the ones column never moves. */
-  graphics_context_set_text_color(ctx, on);
-  graphics_draw_text(ctx, live, font,
-                     GRect(at.x + full.w - live_w, at.y, live_w + 4, full.h + 4),
-                     GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-}
-
-
-/* A BAT-style segmented meter. The reference spends this on battery; here it
-   carries how much of the list is behind you, so the band stays useful. */
-static void draw_segment_meter(GContext *ctx, GPoint origin, int height, int filled, int total, GColor on) {
-  int cells = 6;
-  int cell_w = 3;
-  int gap = 2;
-  if (total < 1) {
-    total = 1;
-  }
-  int lit = (filled * cells) / total;
-  if (lit < 1 && filled > 0) {
-    lit = 1;
-  }
-  for (int i = 0; i < cells; i++) {
-    graphics_context_set_fill_color(ctx, i < lit ? on : lcd_dim());
-    graphics_fill_rect(ctx, GRect(origin.x + i * (cell_w + gap), origin.y, cell_w, height), 0, GCornerNone);
+  int divisor = columns == 3 ? 100 : 10;
+  for (int digit = 0; digit < columns; digit++, divisor /= 10) {
+    int number = value / divisor % 10;
+    bool blank = value < 0 || (!leading_zero && divisor > 1 && value < divisor);
+    for (int row = 0; row < 7; row++) {
+      for (int column = 0; column < 5; column++) {
+        bool lit = !blank && (digits[number][row] & (16 >> column));
+        graphics_context_set_fill_color(ctx, lit ? ink : lcd_ghost_tone());
+        graphics_fill_rect(ctx, GRect(at.x + (digit * 6 + column) * pitch,
+                                      at.y + row * pitch, pitch - 1, pitch - 1),
+                           0, GCornerNone);
+      }
+    }
   }
 }
 
-/* The day strip, reused as a host strip: one square per configured machine,
-   the one in view filled in. */
+/* Three-column glyphs for compact instrument labels and split counts. */
+static void draw_matrix_label(GContext *ctx, GPoint at, const char *text, int pitch, GColor ink) {
+  static const uint8_t letters[26][5] = {
+    {2,5,7,5,5}, {6,5,6,5,6}, {3,4,4,4,3}, {6,5,5,5,6},
+    {7,4,6,4,7}, {7,4,6,4,4}, {3,4,5,5,3}, {5,5,7,5,5},
+    {7,2,2,2,7}, {1,1,1,5,2}, {5,5,6,5,5}, {4,4,4,4,7},
+    {5,7,7,5,5}, {5,7,7,7,5}, {2,5,5,5,2}, {6,5,6,4,4},
+    {2,5,5,7,3}, {6,5,6,5,5}, {3,4,2,1,6}, {7,2,2,2,2},
+    {5,5,5,5,7}, {5,5,5,5,2}, {5,5,7,7,5}, {5,5,2,5,5},
+    {5,5,2,2,2}, {7,1,2,4,7}
+  };
+  static const uint8_t digits[10][5] = {
+    {7,5,5,5,7}, {2,6,2,2,7}, {6,1,2,4,7}, {6,1,2,1,6}, {5,5,7,1,1},
+    {7,4,6,1,6}, {3,4,6,5,2}, {7,1,2,2,2}, {2,5,2,5,2}, {2,5,3,1,6}
+  };
+  graphics_context_set_fill_color(ctx, ink);
+  for (; *text; text++, at.x += 4 * pitch) {
+    const uint8_t *glyph = NULL;
+    if (*text >= 'A' && *text <= 'Z') glyph = letters[*text - 'A'];
+    if (*text >= '0' && *text <= '9') glyph = digits[*text - '0'];
+    if (!glyph) continue;
+    for (int row = 0; row < 5; row++) {
+      for (int column = 0; column < 3; column++) {
+        if (glyph[row] & (4 >> column)) {
+          graphics_fill_rect(ctx, GRect(at.x + column * pitch, at.y + row * pitch, pitch, pitch),
+                             0, GCornerNone);
+        }
+      }
+    }
+  }
+}
+
 static void draw_host_strip(GContext *ctx, GPoint origin, int count, int current, GColor on) {
   int cell = 5;
   int gap = 3;
@@ -1058,7 +949,6 @@ static GRect draw_panel(GContext *ctx, GRect bounds) {
   graphics_fill_rect(ctx, panel, 2, GCornersAll);
   graphics_context_set_stroke_color(ctx, lcd_dim());
   graphics_draw_round_rect(ctx, panel, 2);
-  draw_panel_bevel(ctx, panel);
   return panel;
 }
 
@@ -1120,19 +1010,50 @@ static void draw_bottom_band(GContext *ctx, GRect bounds, const char *left, cons
   }
 }
 
-/* The rail turns into the progress indicator while the phone is working, so
-   nothing extra has to appear on screen. */
+/* Open a center line first, then unfold it into staggered rows. Clear the
+   outside pixels first so the field folds closed before the next pass. */
+static void draw_loading_matrix(GContext *ctx, GRect field, int row_pitch,
+                                uint32_t delay_ms, GColor unlit, GColor lit) {
+  const int column_pitch = 4;
+  const int cycle_ms = 1320;
+  uint32_t elapsed = animation_clock_ms() - s_busy_started_ms;
+  int phase = elapsed < delay_ms ? -1 : (int)((elapsed - delay_ms) % cycle_ms);
+  int columns = field.size.w / column_pitch;
+  int rows = field.size.h / row_pitch;
+  for (int row = 0; row < rows; row++) {
+    int row_distance = abs(2 * row + 1 - rows);
+    for (int column = 0; column < columns; column++) {
+      int column_distance = abs(2 * column + 1 - columns);
+      int stagger = ((row + column) % 3) * 32;
+      int reveal = row_distance <= 1
+        ? column_distance * 300 / columns
+        : 320 + row_distance * 290 / rows + column_distance * 70 / columns;
+      int clear = 850 + (columns - column_distance) * 180 / columns +
+                  (rows - row_distance) * 110 / rows;
+      bool visible = phase >= reveal + stagger && phase < clear + stagger;
+      graphics_context_set_fill_color(ctx, visible ? lit : unlit);
+      graphics_fill_rect(ctx, GRect(field.origin.x + column * column_pitch,
+                                    field.origin.y + row * row_pitch,
+                                    2, row_pitch == 1 ? 1 : 2), 0, GCornerNone);
+    }
+  }
+}
+
 static void draw_busy_rail(GContext *ctx, GRect bounds, int y) {
+  GRect rail = GRect(0, y, bounds.size.w, RAIL_HEIGHT);
   graphics_context_set_fill_color(ctx, chassis());
-  graphics_fill_rect(ctx, GRect(0, y - 4, bounds.size.w, RAIL_HEIGHT + 4), 0, GCornerNone);
-  int span = bounds.size.w - 14;
-  int phase = s_stream_phase % 40;
-  int t = phase < 20 ? phase : 40 - phase;
-  int eased = (t * t * (60 - 2 * t)) / 4000;
-  int width = span / 3;
-  int x = 7 + (eased * (span - width)) / 100;
-  graphics_context_set_fill_color(ctx, rule_color());
-  graphics_fill_rect(ctx, GRect(x, y, width, RAIL_HEIGHT), 0, GCornerNone);
+  graphics_fill_rect(ctx, rail, 0, GCornerNone);
+  draw_loading_matrix(ctx, GRect(8, y, bounds.size.w - 16, RAIL_HEIGHT), 1, 0,
+                      GColorDarkGray, rule_color());
+}
+
+static void draw_loading_content(GContext *ctx, GRect bounds, int y, const char *label) {
+  const int width = 112;
+  draw_loading_matrix(ctx, GRect((bounds.size.w - width) / 2, y, width, 36), 4, 0,
+                      lcd_ghost_tone(), active_color());
+  int label_width = (int)strlen(label) * 8;
+  draw_matrix_label(ctx, GPoint((bounds.size.w - label_width) / 2, y + 43),
+                    label, 2, active_color());
 }
 
 /* Micro caption, the size the reference uses for BAT and the day letters. */
@@ -1239,9 +1160,7 @@ static const char *state_word(const char *state) {
 /* A square block, not a dot: the reference marks its day strip and battery in
    squares, and shape (filled / hollow / struck) carries the state on the
    monochrome watches where colour cannot. */
-/* `animated` is false wherever the screen has to be free to sit still. Running
-   is already carried by colour and by the filled shape; the breathing is a
-   flourish, and on the home screen a flourish costs a timer that never stops. */
+/* Running rows animate only while they are visible in the thread list. */
 static void draw_state_mark(GContext *ctx, GRect box, const char *state, bool inverted,
                             bool animated) {
   GColor ink = inverted ? lcd_glass() : state_color(state);
@@ -1250,10 +1169,14 @@ static void draw_state_mark(GContext *ctx, GRect box, const char *state, bool in
 
   GRect mark = box;
   if (animated && state_is(state, "run")) {
-    int phase = (s_stream_phase / 4) % 8;
-    int grow = phase < 4 ? phase : 8 - phase;
-    mark = GRect(box.origin.x - grow / 2, box.origin.y - grow / 2,
-                 box.size.w + grow, box.size.h + grow);
+    int step = (s_stream_phase / 4) % 4;
+    const GPoint cells[] = { {0, 0}, {4, 0}, {4, 4}, {0, 4} };
+    for (int i = 0; i < 4; i++) {
+      graphics_context_set_fill_color(ctx, i == step ? lcd_ghost_tone() : ink);
+      graphics_fill_rect(ctx, GRect(box.origin.x + cells[i].x, box.origin.y + cells[i].y,
+                                    3, 3), 0, GCornerNone);
+    }
+    return;
   }
 
   graphics_context_set_fill_color(ctx, ink);
@@ -1278,17 +1201,8 @@ static void draw_state_mark(GContext *ctx, GRect box, const char *state, bool in
 
 /* ------------------------------------------------------------ host screen */
 
-/* The home screen is an instrument, not a list: one big segment readout for
-   the number that matters on this machine, a boxed field carrying the other
-   three counts, and the host strip along the bottom. UP/DOWN steps machines
-   the way a mode button steps a watch. */
-
-/* The strip the progress sweep owns while a refresh is in flight. Covers the
-   static rail's tapered ends as well as the bar itself, so the two never show
-   through each other. */
+/* The progress sweep repaints only this strip while a request is in flight. */
 static GRect host_rail_box(void) {
-  /* Exactly the band draw_busy_rail paints: four rows above the rail, which is
-     what covers the static rail's upward taper, plus the rail itself. */
   return GRect(0, LEGEND_HEIGHT - 4, SCREEN_W, RAIL_HEIGHT + 4);
 }
 
@@ -1312,37 +1226,17 @@ static void host_rail_update_proc(Layer *layer, GContext *ctx) {
 }
 
 static void draw_self_test(GContext *ctx, GRect panel, const char *title, const char *hint) {
-  /* Nothing to show is still a working instrument: the glass runs its
-     all-segments test, which is what a real one does with no data. */
-  GFont font = s_font_dseg_big;
-  int y = panel.origin.y + 10;
-  if (font) {
-    GSize full = s_seg_self_test;
-    int x = panel.origin.x + (panel.size.w - full.w) / 2;
-    graphics_context_set_text_color(ctx, lcd_ghost_tone());
-    graphics_draw_text(ctx, "88", font, GRect(x, y, full.w + 4, full.h + 4),
-                       GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-    hatch_rect(ctx, GRect(x, y, full.w + 2, full.h + 2));
-
-    /* A stationary elapsed timer makes a slow host legible without sending a
-       digit walking out of the LCD field. It rides the existing busy timer;
-       stream_timer_callback limits full-panel redraws to one per second. */
-    if (!s_hosts_synced) {
-      int elapsed = connecting_elapsed_seconds();
-      char counter[3];
-      snprintf(counter, sizeof(counter), "%02d", elapsed);
-      s_connect_draw_second = elapsed;
-      graphics_context_set_text_color(ctx, lcd_ink());
-      graphics_draw_text(ctx, counter, font, GRect(x, y, full.w + 4, full.h + 4),
-                         GTextOverflowModeFill, GTextAlignmentLeft, NULL);
-    }
-    y += full.h + 4;
-  } else {
-    y += 34;
+  const int pitch = 8;
+  int counter_width = 11 * pitch - 1;
+  int elapsed = s_hosts_synced ? -1 : connecting_elapsed_seconds();
+  if (elapsed >= 0) {
+    s_connect_draw_second = elapsed;
   }
-
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(panel.origin.x + 8, y, panel.size.w - 16, 1), 0, GCornerNone);
+  draw_matrix_number(ctx, GPoint(panel.origin.x + (panel.size.w - counter_width) / 2,
+                               panel.origin.y + 14),
+                   elapsed, 2, pitch, true, lcd_ink());
+  int y = panel.origin.y + 79;
+  draw_dot_rule(ctx, panel.origin.x + 8, y, panel.size.w - 16, lcd_dim());
 
   graphics_context_set_text_color(ctx, lcd_ink());
   int tw = tracked_width(title, font_legend());
@@ -1362,51 +1256,53 @@ static void draw_self_test(GContext *ctx, GRect panel, const char *title, const 
                                  panel.origin.y + panel.size.h - 17), lcd_ink());
 }
 
-/* One channel of the home screen, drawn as a Casio sub-display: a boxed field
-   holding a segment readout, the state it counts, and a 14-square roster.
-   Three stacked is the whole screen.
-
-   They are deliberately the same size. Which state matters is a property of
-   the machine right now, not of the layout. Needs-you uses the Casio alert red
-   on the same LCD field as its neighbours, without a black inversion. */
-static void draw_state_band(GContext *ctx, GRect band, const char *state, const char *label,
-                            int count, int first_count, int second_count,
-                            const char *second_state) {
-  GColor ink = count > 0 ? state_color(state) : lcd_dim();
-  GColor unlit = lcd_ghost_tone();
-
+/* The roster caps at fourteen threads. The readout and split labels carry
+   the totals even when the roster fills. */
+static void draw_state_band(GContext *ctx, GRect band, const char *label,
+                            int first_count, GColor first_ink, const char *first_label,
+                            int second_count, GColor second_ink, const char *second_label) {
+  int count = first_count + second_count;
+  GColor ink = first_count > 0 ? first_ink : second_count > 0 ? second_ink : lcd_dim();
   draw_field_box(ctx, band);
 
-  GSize block = seg_block_size(SegMid);
-  int pad = 5;
-  int seg_x = band.origin.x + pad;
-  draw_seg_value_ex(ctx, GPoint(seg_x, band.origin.y + (band.size.h - block.h) / 2),
-                    clamp_int(count, 0, 99), ink, SegMid, unlit, true);
+  const int readout_width = 56;
+  const int pad = 5;
+  int columns = count > 99 ? 3 : 2;
+  int pitch = columns == 3 ? 3 : 4;
+  int number_width = (6 * columns - 1) * pitch - 1;
+  int readout_x = band.origin.x + pad + (readout_width - number_width) / 2;
+  draw_matrix_number(ctx, GPoint(readout_x, band.origin.y + (band.size.h - 7 * pitch + 1) / 2),
+                     clamp_int(count, 0, 999), columns, pitch, false, ink);
 
-  int text_x = seg_x + block.w + 8;
+  int text_x = band.origin.x + pad + readout_width + 8;
   int text_w = band.origin.x + band.size.w - pad - text_x;
+  draw_matrix_label(ctx, GPoint(text_x, band.origin.y + 5), label, 2, ink);
 
-  graphics_context_set_text_color(ctx, ink);
-  draw_tracked_max(ctx, label, font_legend(), GPoint(text_x, band.origin.y + 7), text_w);
-
-  /* This is a capped roster, not a percentage bar: one square is one thread
-     through 14, and 14+ fills the strip. The large segment readout remains
-     exact. Fixed 5px cells keep these looking like the chunky squares from
-     the original dashboard. The second colour lets running and monitoring coexist. */
   const int slots = 14;
   const int cell = 5;
   const int gap = 2;
   const int meter_w = slots * cell + (slots - 1) * gap;
   int meter_x = text_x + (text_w - meter_w) / 2;
-  int meter_y = band.origin.y + 25;
-  GColor second_ink = second_count > 0 ? state_color(second_state) : ink;
+  int meter_y = band.origin.y + 21;
   for (int i = 0; i < slots; i++) {
-    GColor square = i < first_count ? ink :
-                    (i < first_count + second_count ? second_ink : unlit);
-    graphics_context_set_fill_color(ctx, square);
-    graphics_fill_rect(ctx,
-                       GRect(meter_x + i * (cell + gap), meter_y, cell, cell),
-                       0, GCornerNone);
+    GColor tone = i < first_count ? first_ink :
+                  i < count ? second_ink : lcd_ghost_tone();
+    graphics_context_set_fill_color(ctx, tone);
+    for (int row = 0; row < 2; row++) {
+      for (int column = 0; column < 2; column++) {
+        graphics_fill_rect(ctx, GRect(meter_x + i * (cell + gap) + column * 3,
+                                        meter_y + row * 3, 2, 2), 0, GCornerNone);
+      }
+    }
+  }
+
+  if (second_label) {
+    char split[12];
+    snprintf(split, sizeof(split), "%s %d", first_label, clamp_int(first_count, 0, 999));
+    draw_matrix_label(ctx, GPoint(meter_x, band.origin.y + 32), split, 1, first_ink);
+    snprintf(split, sizeof(split), "%s %d", second_label, clamp_int(second_count, 0, 999));
+    draw_matrix_label(ctx, GPoint(meter_x + meter_w - (int)strlen(split) * 4, band.origin.y + 32),
+                      split, 1, second_ink);
   }
 }
 
@@ -1431,8 +1327,8 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   /* Always the static rail: s_host_rail_layer sits on top of it and carries the
      sweep while a refresh is in flight, so the panel never has to repaint for
      the animation. */
-  draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
-  draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME, false);
+  draw_rail(ctx, bounds, LEGEND_HEIGHT);
+  draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME);
 
   if (!s_hosts_synced) {
     draw_self_test(ctx, panel, "CONNECTING", "Reaching the phone bridge");
@@ -1452,8 +1348,6 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
   HostItem *host = &s_hosts[clamp_int(s_host_cursor, 0, s_host_count - 1)];
   int inner_x = panel.origin.x + 7;
   int inner_w = panel.size.w - 14;
-  int unsettled = host->needs + host->run + host->monitor + host->idle;
-  int total = unsettled + host->settled;
   int strip_y = panel.origin.y + panel.size.h - 15;
 
   /* A host that did not answer has no counts worth reading: the trio would be
@@ -1463,7 +1357,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
      thing here that can be acted on. */
   if (state_is(host->state, "offline")) {
     graphics_context_set_text_color(ctx, lcd_ink());
-    graphics_draw_text(ctx, host->title, font_row_title(),
+    graphics_draw_text(ctx, host->title, font_display_title(),
                        GRect(inner_x, panel.origin.y + 2, inner_w, 20),
                        GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
     graphics_context_set_text_color(ctx, alert_color());
@@ -1480,8 +1374,7 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
 
     draw_caption(ctx, "SELECT TO RETRY", GPoint(inner_x, strip_y - 19), lcd_ink());
 
-    graphics_context_set_fill_color(ctx, lcd_dim());
-    graphics_fill_rect(ctx, GRect(inner_x, strip_y - 5, inner_w, 1), 0, GCornerNone);
+    draw_dot_rule(ctx, inner_x, strip_y - 5, inner_w, lcd_dim());
     char offline_age[12];
     sync_age_text(offline_age, sizeof(offline_age));
     char offline_sync[20];
@@ -1493,11 +1386,9 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
     return;
   }
 
-  /* The machine, with what it holds underneath. Settled sits here rather than
-     in the bands below: it is history. Monitoring shares the running band so
-     quiet background work remains work while keeping its own green squares. */
+  int unsettled = host->needs + host->errors + host->run + host->monitor + host->idle;
   graphics_context_set_text_color(ctx, lcd_ink());
-  graphics_draw_text(ctx, host->title, font_row_title(),
+  graphics_draw_text(ctx, host->title, font_display_title(),
                      GRect(inner_x, panel.origin.y + 2, inner_w, 20),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
   char sub[36];
@@ -1505,43 +1396,27 @@ static void host_layer_update_proc(Layer *layer, GContext *ctx) {
            clamp_int(unsettled, 0, 999), unsettled == 1 ? "" : "S",
            clamp_int(host->settled, 0, 999));
   draw_caption(ctx, sub, GPoint(inner_x, panel.origin.y + 19), lcd_ink());
+  draw_dot_rule(ctx, inner_x, panel.origin.y + 36, inner_w, lcd_dim());
 
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(inner_x, panel.origin.y + 36, inner_w, 1), 0, GCornerNone);
-
-  /* Three channels filling the glass. The screen this replaced spent its one
-     big readout on whichever state happened to be the headline and squeezed
-     the rest into a strip of 18px digits, which left 43 rows of the panel --
-     roughly a quarter of it -- empty above the indicator row. */
   int bands_top = panel.origin.y + 40;
   int bands_bottom = strip_y - 7;
   int band_gap = 3;
   int band_h = (bands_bottom - bands_top - 2 * band_gap) / 3;
-  int running_count = host->run + host->monitor;
-  const char *band_state[3] = { "needs", "run", "idle" };
-  const char *band_label[3] = { "NEEDS YOU", "RUNNING", "IDLE" };
-  int band_count[3] = { host->needs, running_count, host->idle };
-  for (int i = 0; i < 3; i++) {
-    int primary_count = i == 1 ? host->run : band_count[i];
-    int secondary_count = i == 1 ? host->monitor : 0;
-    draw_state_band(ctx, GRect(inner_x, bands_top + i * (band_h + band_gap), inner_w, band_h),
-                    band_state[i], band_label[i], band_count[i], primary_count,
-                    secondary_count, "monitor");
-  }
+  GRect band = GRect(inner_x, bands_top, inner_w, band_h);
+  draw_state_band(ctx, band, "ATTENTION", host->needs, alert_color(), "INPUT",
+                  host->errors, alert_color(), "ERROR");
+  band.origin.y += band_h + band_gap;
+  draw_state_band(ctx, band, "IN FLIGHT", host->run, active_color(), "RUN",
+                  host->monitor, monitoring_color(), "WAIT");
+  band.origin.y += band_h + band_gap;
+  draw_state_band(ctx, band, "IDLE", host->idle, lcd_ink(), NULL, 0, lcd_ink(), NULL);
 
-  /* The indicator row: hairline, meter with its caption, sync age, and the
-     day strip carrying which machine is in view. */
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(inner_x, strip_y - 5, inner_w, 1), 0, GCornerNone);
-
-  draw_caption(ctx, "ACT", GPoint(inner_x, strip_y - 4), lcd_ink());
-  draw_segment_meter(ctx, GPoint(inner_x + 24, strip_y + 2), 7, unsettled, total, glass_accent());
-
+  draw_dot_rule(ctx, inner_x, strip_y - 5, inner_w, lcd_dim());
   char age[12];
   sync_age_text(age, sizeof(age));
   char sync_line[20];
-  snprintf(sync_line, sizeof(sync_line), "SYN %s", age);
-  draw_caption(ctx, sync_line, GPoint(inner_x + 62, strip_y - 4), lcd_ink());
+  snprintf(sync_line, sizeof(sync_line), "SYNC %s", age);
+  draw_caption(ctx, sync_line, GPoint(inner_x, strip_y - 4), lcd_ink());
 
   draw_host_strip(ctx, GPoint(panel.origin.x + panel.size.w - 8 - s_host_count * 8, strip_y + 1),
                   s_host_count, s_host_cursor, glass_accent());
@@ -1639,9 +1514,13 @@ static void diag_layer_update_proc(Layer *layer, GContext *ctx) {
 
   char count[16];
   snprintf(count, sizeof(count), "%d", s_error_total);
-  draw_legend_band(ctx, bounds, "DIAG", s_error_total > 0 ? "" : count);
-  draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
-  draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME, false);
+  draw_legend_band(ctx, bounds, "DIAG", busy_any() ? "SYNC" : s_error_total > 0 ? "" : count);
+  if (busy_any()) {
+    draw_busy_rail(ctx, bounds, LEGEND_HEIGHT);
+  } else {
+    draw_rail(ctx, bounds, LEGEND_HEIGHT);
+  }
+  draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME);
 
   int x = panel.origin.x + 7;
   int w = panel.size.w - 14;
@@ -1750,21 +1629,13 @@ static void diag_window_unload(Window *window) {
 /* ---------------------------------------------------------- thread screen */
 
 static void draw_ghost_row(GContext *ctx, GRect bounds, int row) {
-  int lit = (s_stream_phase / 3) % (GHOST_ROWS + 2);
-  GColor tone = (row == lit) ? lcd_ink() : lcd_dim();
-  int widths[GHOST_ROWS] = { 74, 96, 62, 84 };
-  int width = widths[row % GHOST_ROWS];
-  if (width > bounds.size.w - 26) {
-    width = bounds.size.w - 26;
-  }
-
+  const int widths[GHOST_ROWS] = { 112, 136, 96, 124 };
+  int width = clamp_int(widths[row % GHOST_ROWS], 0, bounds.size.w - 26);
   graphics_context_set_fill_color(ctx, lcd_glass());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-  graphics_context_set_fill_color(ctx, tone);
-  graphics_fill_rect(ctx, GRect(6, bounds.size.h / 2 - 9, 7, 7), 0, GCornerNone);
-  graphics_fill_rect(ctx, GRect(19, bounds.size.h / 2 - 9, width, 8), 0, GCornerNone);
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(19, bounds.size.h / 2 + 3, width / 2, 5), 0, GCornerNone);
+  draw_loading_matrix(ctx, GRect(20, bounds.size.h / 2 - 9, width, 16), 4,
+                      row * 110, lcd_ghost_tone(), active_color());
+  draw_dot_rule(ctx, 7, bounds.size.h - 1, bounds.size.w - 14, lcd_ghost_tone());
 }
 
 /* A pushpin in the 7x9 the row has spare beside the title. The state mark on
@@ -1779,50 +1650,57 @@ static void draw_pin_mark(GContext *ctx, GPoint at) {
 }
 
 static void draw_list_row_ex(GContext *ctx, const Layer *cell_layer, bool selected,
-                             const char *title, const char *detail, const char *state,
-                             bool pinned) {
+                             const char *title, const char *detail, const char *summary,
+                             const char *project, const char *state, bool pinned) {
   GRect bounds = layer_get_bounds(cell_layer);
-  graphics_context_set_fill_color(ctx, lcd_glass());
+  graphics_context_set_fill_color(ctx, selected ? GColorCeleste : lcd_glass());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
   if (selected) {
-    graphics_context_set_stroke_color(ctx, lcd_ink());
-    graphics_draw_round_rect(ctx, GRect(3, 3, bounds.size.w - 6, bounds.size.h - 7), 2);
-    graphics_context_set_fill_color(ctx, lcd_ink());
-    graphics_fill_rect(ctx, GRect(6, bounds.size.h / 2 - 10, 3, 20), 0, GCornerNone);
+    graphics_context_set_fill_color(ctx, active_color());
+    for (int y = 3; y < bounds.size.h - 2; y += 4) {
+      graphics_fill_rect(ctx, GRect(1, y, 2, 2), 0, GCornerNone);
+    }
   }
 
-  draw_state_mark(ctx, GRect(12, bounds.size.h / 2 - 9, 7, 7), state, false, true);
+  draw_state_mark(ctx, GRect(9, 10, 7, 7), state, false, true);
 
-  int title_w = bounds.size.w - 31;
+  int title_width = bounds.size.w - 30;
   if (pinned) {
-    draw_pin_mark(ctx, GPoint(bounds.size.w - 13, 6));
-    title_w -= PIN_MARK_W + 4;
+    draw_pin_mark(ctx, GPoint(bounds.size.w - 14, 9));
+    title_width -= PIN_MARK_W + 4;
   }
   graphics_context_set_text_color(ctx, lcd_ink());
-  graphics_draw_text(ctx, title, font_row_title(),
-                     GRect(25, 0, title_w, 21),
+  graphics_draw_text(ctx, title, font_thread_title(),
+                     GRect(22, 0, title_width, 21),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
 
-  /* Pebble fonts can paint outside their nominal layout rectangle, so merely
-     making the two rectangles disjoint does not guarantee separate ink. Give
-     the detail its own lower band, then clear a five-row guard between the
-     lines after both draws. That makes overlap impossible even with fallback
-     font metrics, without changing the fixed 48px row geometry. */
-  graphics_context_set_text_color(ctx, lcd_ink());
-  graphics_draw_text(ctx, detail, font_row_detail(),
-                     GRect(25, 27, bounds.size.w - 31, 15),
+  GFont metadata_font = fonts_get_system_font(FONT_KEY_GOTHIC_14);
+  graphics_context_set_text_color(ctx, lcd_dim());
+  int metadata_width = bounds.size.w - 30;
+  int project_width = project && project[0] ?
+    clamp_int(measure(project, metadata_font).w, 1, metadata_width / 2) : 0;
+  graphics_draw_text(ctx, detail, metadata_font,
+                     GRect(22, 21, metadata_width - (project_width ? project_width + 5 : 0), 15),
                      GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-  graphics_context_set_fill_color(ctx, lcd_glass());
-  graphics_fill_rect(ctx, GRect(25, 22, bounds.size.w - 31, 5), 0, GCornerNone);
+  if (project_width) {
+    graphics_draw_text(ctx, project, metadata_font,
+                       GRect(22 + metadata_width - project_width, 21, project_width, 15),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentRight, NULL);
+  }
+  if (summary && summary[0]) {
+    graphics_context_set_text_color(ctx, lcd_ink());
+    graphics_draw_text(ctx, summary, metadata_font,
+                       GRect(22, 34, bounds.size.w - 30, 29),
+                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
+  }
 
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(6, bounds.size.h - 1, bounds.size.w - 12, 1), 0, GCornerNone);
+  draw_dot_rule(ctx, 7, bounds.size.h - 1, bounds.size.w - 14, lcd_dim());
 }
 
 static void draw_list_row(GContext *ctx, const Layer *cell_layer, bool selected,
                           const char *title, const char *detail, const char *state) {
-  draw_list_row_ex(ctx, cell_layer, selected, title, detail, state, false);
+  draw_list_row_ex(ctx, cell_layer, selected, title, detail, NULL, NULL, state, false);
 }
 
 static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
@@ -1830,7 +1708,8 @@ static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
   GRect bounds = layer_get_bounds(layer);
   const char *host = (s_selected_host_index >= 0 && s_selected_host_index < s_host_count)
     ? s_hosts[s_selected_host_index].title : "HOST";
-  bool busy = busy_is(BusyThreads) || !s_threads_synced;
+  bool syncing = busy_is(BusyThreads) || !s_threads_synced;
+  bool busy = syncing || busy_is(BusyModels | BusySending);
 
   graphics_context_set_fill_color(ctx, chassis());
   graphics_fill_rect(ctx, GRect(0, 0, bounds.size.w, TOP_CHROME), 0, GCornerNone);
@@ -1840,8 +1719,12 @@ static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
                                 bounds.size.h - TOP_CHROME - BOTTOM_CHROME), 0, GCornerNone);
 
   char right[20];
-  if (busy) {
+  if (syncing) {
     snprintf(right, sizeof(right), "SYNC");
+  } else if (busy_is(BusyModels)) {
+    snprintf(right, sizeof(right), "MODELS");
+  } else if (busy_is(BusySending)) {
+    snprintf(right, sizeof(right), "SEND");
   } else {
     snprintf(right, sizeof(right), "%d", s_session_count);
   }
@@ -1850,9 +1733,9 @@ static void thread_chrome_update_proc(Layer *layer, GContext *ctx) {
   if (busy) {
     draw_busy_rail(ctx, bounds, LEGEND_HEIGHT);
   } else {
-    draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
+    draw_rail(ctx, bounds, LEGEND_HEIGHT);
   }
-  draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME, false);
+  draw_rail(ctx, bounds, bounds.size.h - BOTTOM_CHROME);
 
   int needs = 0, running = 0, monitoring = 0, settled = 0;
   for (int i = 0; i < s_session_count; i++) {
@@ -1986,11 +1869,10 @@ static void thread_draw_header(GContext *ctx, const Layer *cell_layer, uint16_t 
   GRect bounds = layer_get_bounds(cell_layer);
   graphics_context_set_fill_color(ctx, lcd_glass());
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
-  graphics_context_set_stroke_color(ctx, lcd_dim());
-  graphics_draw_rect(ctx, GRect(4, 2, bounds.size.w - 8, bounds.size.h - 4));
-  graphics_context_set_text_color(ctx, lcd_ink());
-  draw_tracked(ctx, label, font_legend(),
-               GPoint(GLASS_PAD, ink_origin_y(bounds, font_legend())));
+  int label_width = (int)strlen(label) * 8;
+  draw_matrix_label(ctx, GPoint(GLASS_PAD, 3), label, 2, lcd_ink());
+  draw_dot_rule(ctx, GLASS_PAD + label_width + 4, bounds.size.h / 2,
+                bounds.size.w - 2 * GLASS_PAD - label_width - 4, lcd_dim());
 }
 
 static bool thread_list_is_empty(void) {
@@ -2003,7 +1885,8 @@ static int16_t thread_cell_height(MenuLayer *menu_layer, MenuIndex *cell_index, 
        floating in empty space. */
     return s_thread_menu ? layer_get_bounds(menu_layer_get_layer(s_thread_menu)).size.h : ROW_HEIGHT;
   }
-  return ROW_HEIGHT;
+  int index = thread_row_session(cell_index);
+  return index >= 0 && s_sessions[index].has_list_preview ? PREVIEW_ROW_HEIGHT : ROW_HEIGHT;
 }
 
 static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *cell_index, void *data) {
@@ -2018,7 +1901,14 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
       return;
     }
     ProjectItem *project = &s_projects[cell_index->row];
-    draw_list_row(ctx, cell_layer, selected, project->title, project->directory, "idle");
+    bool loading = busy_is(BusyModels) && cell_index->row == s_selected_project_index;
+    draw_list_row(ctx, cell_layer, selected, project->title,
+                  loading ? "Loading models" : project->directory, "idle");
+    if (loading) {
+      GRect bounds = layer_get_bounds(cell_layer);
+      draw_loading_matrix(ctx, GRect(bounds.size.w - 74, 24, 64, 12), 4, 0,
+                          lcd_ghost_tone(), active_color());
+    }
     return;
   }
 
@@ -2029,7 +1919,7 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
     if (pinned_index >= 0) {
       SessionItem *pinned = &s_sessions[pinned_index];
       draw_list_row_ex(ctx, cell_layer, selected, pinned->title, pinned->detail,
-                       pinned->state, true);
+                       pinned->has_list_preview ? pinned->summary : NULL, pinned->project_name, pinned->state, true);
     }
     return;
   }
@@ -2068,8 +1958,8 @@ static void thread_draw_row(GContext *ctx, const Layer *cell_layer, MenuIndex *c
     return;
   }
   SessionItem *item = &s_sessions[index];
-  draw_list_row_ex(ctx, cell_layer, selected, item->title, item->detail, item->state,
-                   item->pinned);
+  draw_list_row_ex(ctx, cell_layer, selected, item->title, item->detail,
+                   item->has_list_preview ? item->summary : NULL, item->project_name, item->state, item->pinned);
 }
 
 /* Holding the new-project row describes a location instead of naming one: the
@@ -2637,6 +2527,10 @@ static int context_content_height(int width) {
   return clamp_int(y + CARD_PAD, DETAIL_CONTENT_MIN_HEIGHT, DETAIL_CONTENT_HEIGHT);
 }
 
+static int detail_title_height(const char *title, int width) {
+  return clamp_int(text_height(title, font_thread_title(), width - 20), 22, 44);
+}
+
 static int detail_content_height_for_width(int width) {
   if (s_showing_context) {
     return context_content_height(width);
@@ -2646,7 +2540,11 @@ static int detail_content_height_for_width(int width) {
   }
   SessionItem *item = &s_sessions[s_selected_index];
   const char *summary = item->summary[0] ? item->summary : "No summary yet.";
-  int height = 42 + text_height(summary, font_body(), width - 20) + 48;
+  int height = detail_title_height(item->title, width) + 24 +
+               text_height(summary, font_body(), width - 20) + 28;
+  if (item->thread_meta[0]) {
+    height += 22 + text_height(item->thread_meta, fonts_get_system_font(FONT_KEY_GOTHIC_14), width - 20);
+  }
   return clamp_int(height, DETAIL_CONTENT_MIN_HEIGHT, DETAIL_CONTENT_HEIGHT);
 }
 
@@ -2669,11 +2567,12 @@ static void update_detail_text(void) {
 
 static int draw_context_card(GContext *ctx, int y, int width, const char *role, const char *body, int card_h) {
   bool from_user = strcmp(role, "You") == 0;
-  graphics_context_set_fill_color(ctx, from_user ? lcd_ink() : lcd_dim());
-  graphics_fill_rect(ctx, GRect(6, y + 2, 2, card_h - 8), 0, GCornerNone);
-
-  graphics_context_set_text_color(ctx, lcd_ink());
-  draw_tracked(ctx, from_user ? "YOU" : "AGENT", font_legend(), GPoint(13, y - 4));
+  GColor role_color = from_user ? active_color() : lcd_ink();
+  graphics_context_set_fill_color(ctx, role_color);
+  for (int dot = y + 2; dot < y + card_h - 6; dot += 4) {
+    graphics_fill_rect(ctx, GRect(6, dot, 2, 2), 0, GCornerNone);
+  }
+  draw_matrix_label(ctx, GPoint(13, y + 1), from_user ? "YOU" : "AGENT", 2, role_color);
 
   graphics_context_set_text_color(ctx, lcd_ink());
   graphics_draw_text(ctx, body, font_body(), GRect(13, y + 12, width - 20, card_h - 14),
@@ -2683,15 +2582,7 @@ static int draw_context_card(GContext *ctx, int y, int width, const char *role, 
 
 static void draw_context_page(GContext *ctx, GRect bounds) {
   if (busy_is(BusyContext)) {
-    for (int i = 0; i < 3; i++) {
-      int lit = (s_stream_phase / 3) % 4;
-      graphics_context_set_fill_color(ctx, i == lit ? lcd_ink() : lcd_dim());
-      int w = 60 + i * 30;
-      if (w > bounds.size.w - 26) {
-        w = bounds.size.w - 26;
-      }
-      graphics_fill_rect(ctx, GRect(13, 14 + i * 16, w, 8), 0, GCornerNone);
-    }
+    draw_loading_content(ctx, bounds, 14, "READING LOG");
     return;
   }
 
@@ -2734,37 +2625,47 @@ static void detail_content_update_proc(Layer *layer, GContext *ctx) {
   }
 
   SessionItem *item = &s_sessions[s_selected_index];
+  int title_height = detail_title_height(item->title, bounds.size.w);
+  int metadata_y = title_height + 2;
+  int rule_y = metadata_y + 17;
+  int body_y = rule_y + 5;
+  graphics_context_set_text_color(ctx, lcd_ink());
+  graphics_draw_text(ctx, item->title, font_thread_title(),
+                     GRect(10, 2, bounds.size.w - 20, title_height),
+                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
   if (busy_is(BusyDetail)) {
-    graphics_context_set_text_color(ctx, lcd_ink());
-    graphics_draw_text(ctx, item->title, font_row_title(),
-                       GRect(10, -2, bounds.size.w - 20, 21),
-                       GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-    graphics_context_set_fill_color(ctx, lcd_dim());
-    graphics_fill_rect(ctx, GRect(10, 34, bounds.size.w - 20, 1), 0, GCornerNone);
-    for (int i = 0; i < 4; i++) {
-      int lit = (s_stream_phase / 3) % 5;
-      graphics_context_set_fill_color(ctx, i == lit ? lcd_ink() : lcd_dim());
-      int w = bounds.size.w - 26 - (i == 3 ? 40 : 0);
-      graphics_fill_rect(ctx, GRect(13, 42 + i * 14, w, 8), 0, GCornerNone);
-    }
+    draw_dot_rule(ctx, 10, rule_y, bounds.size.w - 20, lcd_dim());
+    draw_loading_content(ctx, bounds, body_y + 9, "READING THREAD");
     return;
   }
   const char *summary = item->summary[0] ? item->summary : "No summary yet.";
-  graphics_context_set_text_color(ctx, lcd_ink());
-  graphics_draw_text(ctx, item->title, font_row_title(),
-                     GRect(10, -2, bounds.size.w - 20, 21),
-                     GTextOverflowModeTrailingEllipsis, GTextAlignmentLeft, NULL);
-  draw_caption(ctx, item->detail, GPoint(10, 17), lcd_ink());
-  if (item->agent[0]) {
-    int aw = tracked_width(item->agent, font_row_detail());
-    draw_caption(ctx, item->agent, GPoint(bounds.size.w - 10 - aw, 17), lcd_ink());
+  int metadata_width = bounds.size.w - 20;
+  int agent_width = clamp_int(tracked_width(item->agent, font_legend()), 0, metadata_width / 2);
+  if (item->agent[0] && agent_width > 0) {
+    draw_tracked_max(ctx, item->agent, font_legend(),
+                     GPoint(bounds.size.w - 10 - agent_width, metadata_y), agent_width);
+    metadata_width -= agent_width + 4;
   }
-  graphics_context_set_fill_color(ctx, lcd_dim());
-  graphics_fill_rect(ctx, GRect(10, 34, bounds.size.w - 20, 1), 0, GCornerNone);
+  draw_tracked_max(ctx, item->detail, font_legend(), GPoint(10, metadata_y), metadata_width);
+  draw_dot_rule(ctx, 10, rule_y, bounds.size.w - 20, lcd_dim());
   graphics_context_set_text_color(ctx, lcd_ink());
-  graphics_draw_text(ctx, summary, font_body(), GRect(10, 38, bounds.size.w - 20, bounds.size.h - 62),
+  int summary_height = text_height(summary, font_body(), bounds.size.w - 20);
+  graphics_draw_text(ctx, summary, font_body(), GRect(10, body_y, bounds.size.w - 20, summary_height + 2),
                      GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
-  draw_caption(ctx, "SELECT LOG   HOLD MENU", GPoint(10, bounds.size.h - 20), lcd_ink());
+  if (item->thread_meta[0]) {
+    int info_y = body_y + summary_height + 8;
+    draw_dot_rule(ctx, 10, info_y, bounds.size.w - 20, lcd_dim());
+    draw_matrix_label(ctx, GPoint(10, info_y + 5), "THREAD INFO", 1, lcd_dim());
+    graphics_context_set_text_color(ctx, lcd_ink());
+    graphics_draw_text(ctx, item->thread_meta, fonts_get_system_font(FONT_KEY_GOTHIC_14),
+                       GRect(10, info_y + 10, bounds.size.w - 20, bounds.size.h - info_y - 33),
+                       GTextOverflowModeWordWrap, GTextAlignmentLeft, NULL);
+  }
+  draw_dot_rule(ctx, 10, bounds.size.h - 22, bounds.size.w - 20, lcd_dim());
+  draw_tracked(ctx, "SELECT LOG", font_legend(), GPoint(10, bounds.size.h - 17));
+  const char *menu_hint = "HOLD MENU";
+  draw_tracked(ctx, menu_hint, font_legend(),
+               GPoint(bounds.size.w - 10 - tracked_width(menu_hint, font_legend()), bounds.size.h - 17));
 }
 
 static void detail_header_update_proc(Layer *layer, GContext *ctx) {
@@ -2775,23 +2676,25 @@ static void detail_header_update_proc(Layer *layer, GContext *ctx) {
 
   if (s_selected_index < 0 || s_selected_index >= s_session_count) {
     draw_legend_band(ctx, bounds, "THREAD", "");
-    draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
+    draw_rail(ctx, bounds, LEGEND_HEIGHT);
     return;
   }
   SessionItem *item = &s_sessions[s_selected_index];
   char right[20];
   if (busy_is(BusySending)) {
     snprintf(right, sizeof(right), "SEND");
+  } else if (busy_is(BusyDetail | BusyContext)) {
+    snprintf(right, sizeof(right), "READ");
   } else if (s_showing_context) {
     snprintf(right, sizeof(right), "%d/%d", s_context_page + 1, s_context_page_count);
   } else {
     snprintf(right, sizeof(right), "%s", state_word(item->state));
   }
-  draw_legend_band(ctx, bounds, s_showing_context ? "LOG" : (item->agent[0] ? item->agent : "THREAD"), right);
-  if (busy_is(BusyContext) || busy_is(BusySending)) {
+  draw_legend_band(ctx, bounds, s_showing_context ? "LOG" : "THREAD", right);
+  if (busy_is(BusyDetail | BusyContext | BusySending)) {
     draw_busy_rail(ctx, bounds, LEGEND_HEIGHT);
   } else {
-    draw_rail(ctx, bounds, LEGEND_HEIGHT, true);
+    draw_rail(ctx, bounds, LEGEND_HEIGHT);
   }
 }
 
@@ -3088,6 +2991,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       host->run = int_tuple(iter, KEY_C_RUN, 0);
       host->monitor = int_tuple(iter, KEY_C_MONITOR, 0);
       host->idle = int_tuple(iter, KEY_C_IDLE, 0);
+      host->errors = int_tuple(iter, KEY_C_ERROR, 0);
       host->settled = int_tuple(iter, KEY_C_SETTLED, 0);
       if (index + 1 > s_host_count) {
         s_host_count = index + 1;
@@ -3127,8 +3031,10 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       copy_tuple(item->state, sizeof(item->state), iter, KEY_STATE);
       copy_tuple(item->agent, sizeof(item->agent), iter, KEY_AGENT);
       copy_tuple(item->summary, sizeof(item->summary), iter, KEY_SUMMARY);
+      copy_tuple(item->project_name, sizeof(item->project_name), iter, KEY_THREAD_META);
       copy_tuple(item->request_id, sizeof(item->request_id), iter, KEY_REQUEST_ID);
       copy_tuple(item->request_kind, sizeof(item->request_kind), iter, KEY_REQUEST_KIND);
+      item->has_list_preview = item->summary[0] != '\0';
       item->settled = int_tuple(iter, KEY_SETTLED, 0) != 0;
       item->pinned = int_tuple(iter, KEY_PINNED, 0) != 0;
       if (index + 1 > s_session_count) {
@@ -3225,6 +3131,7 @@ static void inbox_received_callback(DictionaryIterator *iter, void *context) {
       copy_tuple(item->state, sizeof(item->state), iter, KEY_STATE);
       copy_tuple(item->agent, sizeof(item->agent), iter, KEY_AGENT);
       copy_tuple(item->summary, sizeof(item->summary), iter, KEY_SUMMARY);
+      copy_tuple(item->thread_meta, sizeof(item->thread_meta), iter, KEY_THREAD_META);
       copy_tuple(item->request_id, sizeof(item->request_id), iter, KEY_REQUEST_ID);
       copy_tuple(item->request_kind, sizeof(item->request_kind), iter, KEY_REQUEST_KIND);
       if (index + 1 > s_session_count) {
@@ -3459,14 +3366,9 @@ static void minute_tick(struct tm *tick_time, TimeUnits units_changed) {
 static void init(void) {
   s_launched_at = time(NULL);
   s_host_connect_started_at = s_launched_at;
+  s_busy_started_ms = animation_clock_ms();
   s_font_dot = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_20));
   s_font_dot_small = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DOT_10));
-  s_font_dseg_big = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_64));
-  s_font_dseg_mid = fonts_load_custom_font(resource_get_handle(RESOURCE_ID_FONT_DSEG_34));
-  lcd_tiles_create();
-  /* Before any window loads: the panel's field geometry is derived from
-     these, and host_window_load reads it. */
-  lcd_metrics_measure();
 
   reset_hosts();
   reset_sessions();
@@ -3534,11 +3436,8 @@ static void deinit(void) {
   if (s_diag_window) {
     window_destroy(s_diag_window);
   }
-  lcd_tiles_destroy();
   if (s_font_dot) fonts_unload_custom_font(s_font_dot);
   if (s_font_dot_small) fonts_unload_custom_font(s_font_dot_small);
-  if (s_font_dseg_big) fonts_unload_custom_font(s_font_dseg_big);
-  if (s_font_dseg_mid) fonts_unload_custom_font(s_font_dseg_mid);
 }
 
 int main(void) {

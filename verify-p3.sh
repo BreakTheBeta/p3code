@@ -80,27 +80,25 @@ SERVER_PID="$!"
 
 SMOKE_BASE_URL="http://127.0.0.1:$SMOKE_PORT"
 
-ready=0
+# Fold starts listening before its orchestration routes finish initializing.
+# Probe the protected route so a startup 503 cannot pass the readiness check.
+unauthenticated_status=""
 for _ in $(seq 1 80); do
-  if curl --max-time 2 -sS -o /dev/null \
-    "$SMOKE_BASE_URL/.well-known/t3/environment" 2>/dev/null; then
-    ready=1
-    break
-  fi
-  sleep 0.25
+  unauthenticated_status="$(curl --max-time 2 -sS -o /dev/null -w '%{http_code}' \
+    -H "x-t3-orchestration-protocol: 2" \
+    "$SMOKE_BASE_URL/api/orchestration/shell" 2>/dev/null)" || true
+  case "$unauthenticated_status" in
+    000|503|"")
+      kill -0 "$SERVER_PID" 2>/dev/null || break
+      sleep 0.25
+      ;;
+    *) break ;;
+  esac
 done
 
-if [[ "$ready" != "1" ]]; then
-  echo "T3 Code smoke server did not become ready on $SMOKE_BASE_URL." >&2
-  cat /tmp/p3-smoke.log >&2 || true
-  exit 1
-fi
-
-# The orchestration API must reject an unauthenticated read.
-unauthenticated_status="$(curl --max-time 5 -sS -o /dev/null -w '%{http_code}' \
-  "$SMOKE_BASE_URL/api/orchestration/shell")"
 if [[ "$unauthenticated_status" != "401" ]]; then
   echo "Expected 401 without a bearer token, got $unauthenticated_status." >&2
+  cat /tmp/p3-smoke.log >&2
   exit 1
 fi
 

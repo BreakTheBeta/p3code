@@ -9,7 +9,7 @@ Unmodified T3 Code, in either of its two orchestration protocols.
 | Protocol | Server | Verified against |
 | --- | --- | --- |
 | 1 | published `t3` CLI | `t3@0.0.33`, `t3@0.0.38` |
-| 2 | T3 Code Fold and current upstream `main` | `t3@0.3.4` (`BreakTheBeta/T3codefold`) |
+| 2 | T3 Code Fold and current upstream `main` | Fold 0.3.4, 0.4.12 and 0.4.16 (`BreakTheBeta/T3codefold`) |
 
 There is no compatibility branch and no server patch in either case. The earlier fork — which re-added `--auth-token`, legacy `?token=` WebSocket auth, and an `orchestration.getSnapshot` RPC — is no longer used, and must not come back.
 
@@ -93,7 +93,7 @@ A pending request of kind `user_input` is a question; `auth_refresh` is neither 
 
 Reading `response.thread` on protocol 2 yields `undefined`, which surfaces as "Thread not found" for every thread and an empty summary on every row.
 
-Approvals are rebuilt from `runtimeRequests`: `status: "pending"` becomes an `approval.requested`, anything else an `approval.resolved`. `kind` needs no mapping — `ProviderRequestKind` is `command` / `file-read` / `file-change` / `mcp-elicitation` / `permission`. A `user_input` request carries no question text on this route, so the watch cannot rebuild an answerable prompt from it; the thread still reads as needing attention from the shell flags.
+Approvals are rebuilt from `runtimeRequests`: `status: "pending"` becomes an `approval.requested`, anything else an `approval.resolved`. `kind` needs no mapping — `ProviderRequestKind` is `command` / `file-read` / `file-change` / `mcp-elicitation` / `permission`. For a pending `user_input`, P3 joins the request to a `user_input_request` turn item by request ID. The turn item supplies the questions and option values. If the detail projection omits the matching item, the shell still marks the thread as needing attention.
 
 ### Subagent threads
 

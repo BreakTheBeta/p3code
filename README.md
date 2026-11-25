@@ -133,9 +133,10 @@ closes, or when it is merged if settle-on-merge is enabled. An open PR still
 counts as active, matching T3 Code's sidebar. T3's background **Monitoring**
 state is clearly distinguished from idle in both the thread rows and the host
 counts; it stays quiet rather than pulsing like a thread that is really working.
-On the host overview, each small block stands for one thread, up to 14 of them;
-monitoring blocks are green and idle blocks use dark LCD ink. Past that cap, the
-fraction beside them still carries the exact numbers.
+The host dashboard groups input and errors under Attention, running and waiting
+work under In Flight, and idle threads in a third band. Thread rows show the
+project and a recent message when available. Open a thread to see a fuller
+summary and its project, branch, pull request, and model.
 
 ### Offline hosts and diagnostics
 

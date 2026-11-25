@@ -3,7 +3,7 @@
   "shortName": "P3",
   "longName": "P3",
   "companyName": "Break the Beta",
-  "versionLabel": "0.20",
+  "versionLabel": "0.27",
   "sdkVersion": "3",
   "enableMultiJS": true,
   "targetPlatforms": [
@@ -49,7 +49,9 @@
     "instance_id": 33,
     "is_default": 34,
     "c_monitor": 35,
-    "pinned": 36
+    "pinned": 36,
+    "c_error": 37,
+    "thread_meta": 43
   },
   "resources": {
     "media": [
@@ -70,18 +72,6 @@
         "name": "FONT_DOT_10",
         "file": "fonts/Dot6x10-1x.ttf",
         "characterRegex": "[ -~…]"
-      },
-      {
-        "type": "font",
-        "name": "FONT_DSEG_64",
-        "file": "fonts/DSEG7Classic-Bold.ttf",
-        "characterRegex": "[0-9:]"
-      },
-      {
-        "type": "font",
-        "name": "FONT_DSEG_34",
-        "file": "fonts/DSEG7Classic-Bold.ttf",
-        "characterRegex": "[0-9:]"
       }
     ]
   },

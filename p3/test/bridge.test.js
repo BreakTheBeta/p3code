@@ -765,8 +765,11 @@ async function main() {
   shells = {
     [HOST_A]: shellSnapshot({
       threads: [
-        shellThread({ id: "t_needs", hasPendingApprovals: true }),
-        shellThread({ id: "t_monitor", backgroundLiveness: "monitoring" }),
+        shellThread({ id: "t_needs", title: "Release approval", hasPendingApprovals: true,
+          latestVisibleMessage: { text: "Ready to deploy.", updatedAt: iso(56000) } }),
+        shellThread({ id: "t_monitor", title: "Review queue", backgroundLiveness: "monitoring",
+          latestVisibleMessage: { text: "Waiting for review.\nCI passed.", updatedAt: iso(57000) } }),
+        shellThread({ id: "t_error", pinnedAt: iso(1000), session: { status: "error" } }),
       ],
     }),
     [HOST_B]: shellSnapshot({
@@ -793,6 +796,8 @@ async function main() {
   assertJsonEqual(hostRows.map((m) => m.state), ["needs", "settled"])
   assertJsonEqual(hostRows.map((m) => m.detail), ["1 need you", "all settled"])
   assert.strictEqual(hostRows[0].c_monitor, 1)
+  assert.strictEqual(hostRows[0].c_error, 1)
+  assert.strictEqual(hostRows[0].c_idle, 0)
 
   // One shell request per host and nothing more: no per-thread hydration.
   assert.strictEqual(requests.filter((r) => r.pathname === "/api/orchestration/shell").length, 2)
@@ -857,7 +862,7 @@ async function main() {
 
   // ----------------------------------------------------- the thread screen
   shells[HOST_B] = shellSnapshot({
-    threads: [shellThread({ id: "t_settled", settledOverride: "settled", title: "Old work" })],
+    threads: [shellThread({ id: "t_settled", projectId: "proj_mini", settledOverride: "settled", title: "Old work", branch: "workbench" })],
     projects: [
       {
         id: "proj_mini",
@@ -890,6 +895,7 @@ async function main() {
   assert.strictEqual(threadRows[0].settled, 1)
   assert.strictEqual(threadRows[0].session_id, "s2::t_settled")
   assert.strictEqual(threadRows[0].title, "Old work")
+  assert.strictEqual(threadRows[0].thread_meta, "Mini")
   assert.strictEqual(threadRows[0].state, "settled")
   assert.match(threadRows[0].detail, /^settled /)
   const projectRows = sentMessages.filter((m) => m.cmd === CMD.projectItem)
@@ -908,6 +914,7 @@ async function main() {
   const detailMessage = await waitFor(() => sentMessages.find((m) => m.cmd === CMD.detail), "detail-1")
   assert.strictEqual(detailMessage.state, "settled")
   assert.match(detailMessage.summary, /Did the thing/)
+  assert.match(detailMessage.thread_meta, /Project: Mini\nBranch: workbench\nModel: gpt-5.6-sol/)
   // Opening a thread is the first and only body fetch.
   assert.strictEqual(requests.filter((r) => r.pathname === "/api/orchestration/threads/t_settled").length, 1)
 
@@ -1323,6 +1330,16 @@ async function main() {
   assert.strictEqual(byId.v2_idle.session.status, "ready")
   assert.strictEqual(byId.v2_idle.session.providerName, "codex")
 
+  const waiting = context.normalizeV2Thread(v2Thread({
+    status: "running", activityRunStatus: "running", blockedOnThreadWait: true,
+  }))
+  assert.strictEqual(context.threadState(waiting, 60000), "monitor")
+  assert.strictEqual(context.effectiveSettled(waiting, 60000), false)
+  const detachedMonitor = v2Thread({ pendingBackgroundTasks: [{ kind: "monitor", awaited: false }] })
+  assert.strictEqual(context.normalizeV2Thread(detachedMonitor).backgroundLiveness, null)
+  detachedMonitor.pendingBackgroundTasks[0].awaited = true
+  assert.strictEqual(context.normalizeV2Thread(detachedMonitor).backgroundLiveness, "monitoring")
+
   // "idle" describes the thread, not the run that last finished on it.
   assert.strictEqual(byId.v2_idle.latestTurn.state, "completed")
   assert.strictEqual(byId.v2_idle.latestTurn.startedAt, iso(59000))
@@ -1432,11 +1449,19 @@ async function main() {
     runtimeRequests: [
       { id: "rq1", kind: "command", status: "pending", createdAt: iso(5000) },
       { id: "rq2", kind: "file-change", status: "resolved", createdAt: iso(9000) },
-      // No question text travels with these, so they cannot be rebuilt into a
-      // prompt the watch could answer; auth_refresh is not the user's to approve.
+      // A request without a matching turn item still has no prompt to show.
       { id: "rq3", kind: "user_input", status: "pending", createdAt: iso(4000) },
       { id: "rq4", kind: "auth_refresh", status: "pending", createdAt: iso(3000) },
+      { id: "rq5", kind: "user_input", status: "pending", createdAt: iso(6000) },
+      { id: "rq6", kind: "user_input", status: "resolved", createdAt: iso(7000) },
     ],
+    turnItems: [{ type: "approval_request", requestId: "rq1", prompt: "Run the capture", reason: "Needs emulator access" }].concat(["rq5", "rq6"].map((requestId) => ({
+      type: "user_input_request", requestId,
+      questions: [{
+        id: "mode", header: "Mode", question: "Which mode?", allowCustomAnswer: false,
+        options: [{ label: "Quick", value: "fast" }],
+      }],
+    }))),
   })
 
   assert.ok(projection, "a projection must rebuild into a thread")
@@ -1455,8 +1480,18 @@ async function main() {
   assert.strictEqual(approvals.length, 1)
   assert.strictEqual(approvals[0].requestId, "rq1")
   assert.strictEqual(approvals[0].requestKind, "command")
+  assert.strictEqual(approvals[0].detail, "Run the capture\nNeeds emulator access")
   assert.ok(!projection.activities.some((a) => a.payload.requestId === "rq3"))
   assert.ok(!projection.activities.some((a) => a.payload.requestId === "rq4"))
+
+  const questions = context.derivePendingUserInputs(projection.activities)
+  assert.strictEqual(questions.length, 1)
+  assert.strictEqual(questions[0].requestId, "rq5")
+  assert.match(context.pendingSummary({ kind: "question", request: { questions: [
+    questions[0].questions[0], { question: "Which branch?", options: [{ label: "Main" }] },
+  ] } }), /1\. Which mode\?\nOptions: Quick\n\n2\. Which branch\?\nOptions: Main/)
+  assertJsonEqual(context.buildQuestionAnswers(questions[0], "Quick"), [["fast"]])
+  assert.strictEqual(context.buildQuestionAnswers(questions[0], "Other"), null)
 
   assert.strictEqual(context.normalizeV2Projection(v2Server, { thread: null }), null)
 
@@ -1469,7 +1504,8 @@ async function main() {
       snapshotSequence: 1,
       projects: [{ id: "proj_1", title: "Fold", workspaceRoot: "/repo/fold" }],
       threads: [v2Thread({ id: "v2_running", status: "running", activityRunStatus: "running",
-                           activeRunId: "run:1" })],
+                           activeRunId: "run:1",
+                           latestVisibleMessage: { text: "Review ready.\nOpen the report." } })],
       archivedThreads: [],
     },
   }
@@ -1487,6 +1523,17 @@ async function main() {
   // ignores it, which is why it is sent unconditionally.
   assert.strictEqual(shellRead.headers["x-t3-orchestration-protocol"], "2")
   assert.strictEqual(context.protocolByServer["s1"], 2, "learned from the snapshot, not probed")
+
+  sentMessages = []
+  context.selectHost("s1")
+  await waitFor(() => sentMessages.some((m) => m.cmd === CMD.sessionEnd), "Fold thread list")
+  const previewRow = sentMessages.find((m) => m.cmd === CMD.sessionItem)
+  assert.strictEqual(previewRow.summary, "Review ready. Open the report.")
+
+  context.normalizeV2Projection(v2Server, {
+    thread: { id: "v2_running", title: "Running on Fold" },
+    runtimeRequests: [],
+  })
 
   // A write against a protocol-2 host goes over the socket, translated, and
   // must not touch the REST route that server does not have.
