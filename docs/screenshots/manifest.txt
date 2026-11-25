@@ -1,6 +1,7 @@
 P3 screenshot set
 Emulator: emery
 Fixture mode: SCREENSHOT_FIXTURES forced true at build time
+Version: v0.27
 
 Files:
 - 00-host-dashboard.png
@@ -14,7 +15,12 @@ Files:
 - 08-project-create-confirmation.png
 - 09-project-delete-menu.png
 - 10-thread-actions.png
+- 11-host-sync.png
+- 12-thread-loading.png
 
 The deterministic fixture storyboard lives in src/pkjs/index.js and
-CMD_SCREENSHOT_PAGE in src/c/main.c. Regenerate this set from the repo root
+CMD_SCREENSHOT_PAGE in src/c/main.c. Regenerate the first eleven screens from the repo root
 with ./capture-p3-screenshots.sh.
+
+The last two captures use an emulator fixture with requests held open to show
+the v0.27 loading animation.
